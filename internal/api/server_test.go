@@ -11,6 +11,7 @@ import (
 	"time"
 
 	gin "github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
@@ -69,6 +70,15 @@ func TestHealthz(t *testing.T) {
 		}
 		if resp.Status != "ok" {
 			t.Fatalf("unexpected response status: got %q want %q", resp.Status, "ok")
+		}
+		if got := rr.Header().Get("X-Cpa-Version"); got != buildinfo.Version {
+			t.Fatalf("X-Cpa-Version = %q, want %q", got, buildinfo.Version)
+		}
+		if got := rr.Header().Get("X-Cpa-Commit"); got != buildinfo.Commit {
+			t.Fatalf("X-Cpa-Commit = %q, want %q", got, buildinfo.Commit)
+		}
+		if got := rr.Header().Get("X-Cpa-Build-Date"); got != buildinfo.BuildDate {
+			t.Fatalf("X-Cpa-Build-Date = %q, want %q", got, buildinfo.BuildDate)
 		}
 	})
 
