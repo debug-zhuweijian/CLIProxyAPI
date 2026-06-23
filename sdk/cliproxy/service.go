@@ -2330,7 +2330,7 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 		if alias == "" {
 			continue
 		}
-		key := strings.ToLower(alias)
+		key := alias
 		if _, exists := seen[key]; exists {
 			continue
 		}
