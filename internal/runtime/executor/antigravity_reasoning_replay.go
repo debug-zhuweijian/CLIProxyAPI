@@ -422,9 +422,19 @@ func insertAntigravityReasoningReplayItems(payload []byte, items [][]byte) ([]by
 				if strings.TrimSpace(gjson.GetBytes(out, path).String()) != "" {
 					continue
 				}
+				updated, err := sjson.SetBytes(out, path, sig)
+				if err != nil {
+					continue
+				}
+				out = updated
+				changed = true
+				continue
 			}
-			path := antigravityReplayPartWritePath(out, ci, pi) + ".thoughtSignature"
-			updated, err := sjson.SetBytes(out, path, sig)
+			rawPart, err := json.Marshal(map[string]string{"thoughtSignature": sig})
+			if err != nil {
+				continue
+			}
+			updated, err := sjson.SetRawBytes(out, antigravityReplayPartWritePath(out, ci, pi), rawPart)
 			if err != nil {
 				continue
 			}
