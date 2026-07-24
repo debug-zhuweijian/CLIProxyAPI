@@ -108,6 +108,48 @@ func configJSONMap(cfg *config.Config) (map[string]json.RawMessage, error) {
 	return result, nil
 }
 
+func canonicalizeFunctionalConfig(cfg *config.Config) *config.Config {
+	if cfg == nil {
+		return nil
+	}
+	canonical := cfg.CloneForRuntime()
+	canonicalizePayloadRuleModels(canonical.Payload.Default)
+	canonicalizePayloadRuleModels(canonical.Payload.DefaultRaw)
+	canonicalizePayloadRuleModels(canonical.Payload.Override)
+	canonicalizePayloadRuleModels(canonical.Payload.OverrideRaw)
+	for ruleIndex := range canonical.Payload.Filter {
+		canonicalizePayloadModelRules(canonical.Payload.Filter[ruleIndex].Models)
+	}
+	return canonical
+}
+
+func canonicalizePayloadRuleModels(rules []config.PayloadRule) {
+	for ruleIndex := range rules {
+		canonicalizePayloadModelRules(rules[ruleIndex].Models)
+	}
+}
+
+func canonicalizePayloadModelRules(models []config.PayloadModelRule) {
+	for modelIndex := range models {
+		model := &models[modelIndex]
+		if len(model.Headers) == 0 {
+			model.Headers = nil
+		}
+		if len(model.Match) == 0 {
+			model.Match = nil
+		}
+		if len(model.NotMatch) == 0 {
+			model.NotMatch = nil
+		}
+		if len(model.Exist) == 0 {
+			model.Exist = nil
+		}
+		if len(model.NotExist) == 0 {
+			model.NotExist = nil
+		}
+	}
+}
+
 func cloneConfigWithJSONProjection(
 	cfg *config.Config,
 	resetKeys map[string]struct{},
@@ -201,7 +243,7 @@ func (h *Handler) GetFunctionalConfig(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config_unavailable"})
 		return
 	}
-	full, err := configJSONMap(h.cfg)
+	full, err := configJSONMap(canonicalizeFunctionalConfig(h.cfg))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "projection_failed", "message": err.Error()})
 		return

@@ -1,6 +1,7 @@
 package management
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -42,6 +43,20 @@ func decodeProjectionResponse(t *testing.T, recorder *httptest.ResponseRecorder)
 		t.Fatalf("decode response: %v\n%s", err, recorder.Body.String())
 	}
 	return response
+}
+
+func projectionJSON(t *testing.T, cfg *config.Config) []byte {
+	t.Helper()
+	full, err := configJSONMap(canonicalizeFunctionalConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := classifyFunctionalConfig(full)
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func TestGetFunctionalConfigExcludesSecretsAndEnvironment(t *testing.T) {
@@ -88,6 +103,35 @@ func TestGetFunctionalConfigExcludesSecretsAndEnvironment(t *testing.T) {
 	}
 }
 
+func TestFunctionalConfigProjectionCanonicalizesEmptyPayloadSelectors(t *testing.T) {
+	t.Parallel()
+	nilSelectors := &config.Config{
+		SDKConfig: config.SDKConfig{ModelPolicy: testConfiguredModelPolicy()},
+		Payload: config.PayloadConfig{
+			Override: []config.PayloadRule{{
+				Models: []config.PayloadModelRule{{
+					Name:     "glm-5.2[1m]",
+					Protocol: "anthropic",
+				}},
+				Params: map[string]any{"reasoning.effort": "max"},
+			}},
+		},
+	}
+	emptySelectors := nilSelectors.CloneForRuntime()
+	model := &emptySelectors.Payload.Override[0].Models[0]
+	model.Headers = map[string]string{}
+	model.Match = []map[string]any{}
+	model.NotMatch = []map[string]any{}
+	model.Exist = []string{}
+	model.NotExist = []string{}
+
+	nilJSON := projectionJSON(t, nilSelectors)
+	emptyJSON := projectionJSON(t, emptySelectors)
+	if !bytes.Equal(nilJSON, emptyJSON) {
+		t.Fatalf("semantically equivalent payload selectors differ:\nnull:  %s\nempty: %s", nilJSON, emptyJSON)
+	}
+}
+
 func TestPutFunctionalConfigPreservesTargetSecretsAndEnvironment(t *testing.T) {
 	t.Parallel()
 	path := writeTestConfigFile(t)
@@ -123,11 +167,23 @@ func TestPutFunctionalConfigPreservesTargetSecretsAndEnvironment(t *testing.T) {
 	}
 
 	source := &config.Config{
-		SDKConfig:    config.SDKConfig{ModelPolicy: testConfiguredModelPolicy()},
-		Debug:        true,
-		RequestRetry: 7,
+		SDKConfig:                       config.SDKConfig{ModelPolicy: testConfiguredModelPolicy()},
+		Debug:                           true,
+		ErrorLogsMaxFiles:               10,
+		RedisUsageQueueRetentionSeconds: 60,
+		RequestRetry:                    7,
+		WebsocketAuth:                   true,
+		Payload: config.PayloadConfig{
+			Override: []config.PayloadRule{{
+				Models: []config.PayloadModelRule{{
+					Name:     "glm-5.2[1m]",
+					Protocol: "anthropic",
+				}},
+				Params: map[string]any{"reasoning.effort": "max"},
+			}},
+		},
 	}
-	full, err := configJSONMap(source)
+	full, err := configJSONMap(canonicalizeFunctionalConfig(source))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,6 +240,14 @@ func TestPutFunctionalConfigPreservesTargetSecretsAndEnvironment(t *testing.T) {
 		if !strings.Contains(string(written), preserved) {
 			t.Fatalf("persisted config did not preserve %q", preserved)
 		}
+	}
+
+	reloaded, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatalf("reload persisted config: %v", err)
+	}
+	if got, want := projectionJSON(t, reloaded), projectionJSON(t, source); !bytes.Equal(got, want) {
+		t.Fatalf("functional projection changed after save/reload:\nwant: %s\ngot:  %s", want, got)
 	}
 }
 
