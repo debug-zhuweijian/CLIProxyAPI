@@ -113,6 +113,21 @@ func canonicalizeFunctionalConfig(cfg *config.Config) *config.Config {
 		return nil
 	}
 	canonical := cfg.CloneForRuntime()
+	if len(canonical.Payload.Default) == 0 {
+		canonical.Payload.Default = nil
+	}
+	if len(canonical.Payload.DefaultRaw) == 0 {
+		canonical.Payload.DefaultRaw = nil
+	}
+	if len(canonical.Payload.Override) == 0 {
+		canonical.Payload.Override = nil
+	}
+	if len(canonical.Payload.OverrideRaw) == 0 {
+		canonical.Payload.OverrideRaw = nil
+	}
+	if len(canonical.Payload.Filter) == 0 {
+		canonical.Payload.Filter = nil
+	}
 	canonicalizePayloadRuleModels(canonical.Payload.Default)
 	canonicalizePayloadRuleModels(canonical.Payload.DefaultRaw)
 	canonicalizePayloadRuleModels(canonical.Payload.Override)

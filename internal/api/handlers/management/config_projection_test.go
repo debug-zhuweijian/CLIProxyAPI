@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -124,11 +125,54 @@ func TestFunctionalConfigProjectionCanonicalizesEmptyPayloadSelectors(t *testing
 	model.NotMatch = []map[string]any{}
 	model.Exist = []string{}
 	model.NotExist = []string{}
+	emptySelectors.Payload.Default = []config.PayloadRule{}
+	emptySelectors.Payload.DefaultRaw = []config.PayloadRule{}
+	emptySelectors.Payload.OverrideRaw = []config.PayloadRule{}
+	emptySelectors.Payload.Filter = []config.PayloadFilterRule{}
 
 	nilJSON := projectionJSON(t, nilSelectors)
 	emptyJSON := projectionJSON(t, emptySelectors)
 	if !bytes.Equal(nilJSON, emptyJSON) {
 		t.Fatalf("semantically equivalent payload selectors differ:\nnull:  %s\nempty: %s", nilJSON, emptyJSON)
+	}
+}
+
+func TestFunctionalConfigProjectionCanonicalizesEmptyPayloadRuleLists(t *testing.T) {
+	t.Parallel()
+	nilLists := &config.Config{
+		SDKConfig: config.SDKConfig{ModelPolicy: testConfiguredModelPolicy()},
+	}
+	emptyLists := nilLists.CloneForRuntime()
+	emptyLists.Payload.Default = []config.PayloadRule{}
+	emptyLists.Payload.DefaultRaw = []config.PayloadRule{}
+	emptyLists.Payload.Override = []config.PayloadRule{}
+	emptyLists.Payload.OverrideRaw = []config.PayloadRule{}
+	emptyLists.Payload.Filter = []config.PayloadFilterRule{}
+
+	nilJSON := projectionJSON(t, nilLists)
+	emptyJSON := projectionJSON(t, emptyLists)
+	if !bytes.Equal(nilJSON, emptyJSON) {
+		t.Fatalf("semantically equivalent payload rule lists differ:\nnull:  %s\nempty: %s", nilJSON, emptyJSON)
+	}
+}
+
+func TestFunctionalConfigProjectionPreservesNonEmptyPayloadRuleLists(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{ModelPolicy: testConfiguredModelPolicy()},
+		Payload: config.PayloadConfig{
+			Default:     []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "default"}}, Params: map[string]any{"a": "b"}}},
+			DefaultRaw:  []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "default-raw"}}, Params: map[string]any{"c": "d"}}},
+			Override:    []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "override"}}, Params: map[string]any{"e": "f"}}},
+			OverrideRaw: []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "override-raw"}}, Params: map[string]any{"g": "h"}}},
+			Filter:      []config.PayloadFilterRule{{Models: []config.PayloadModelRule{{Name: "filter"}}, Params: []string{"response_format"}}},
+		},
+	}
+	want := cfg.CloneForRuntime().Payload
+
+	got := canonicalizeFunctionalConfig(cfg).Payload
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("non-empty payload rule lists changed:\nwant: %#v\ngot:  %#v", want, got)
 	}
 }
 
@@ -169,7 +213,7 @@ func TestPutFunctionalConfigPreservesTargetSecretsAndEnvironment(t *testing.T) {
 					Params: []string{"response_format"},
 				}},
 			},
-			Debug:     false,
+			Debug: false,
 			Home: config.HomeConfig{
 				Enabled: true,
 				NodeID:  "target-home-node",
