@@ -149,6 +149,26 @@ func TestPutFunctionalConfigPreservesTargetSecretsAndEnvironment(t *testing.T) {
 			TLS:       config.TLSConfig{Enable: true, Cert: "target-cert.pem", Key: "target-key.pem"},
 			Plugins:   config.PluginsConfig{Enabled: true, Dir: "target-plugins"},
 			ClaudeKey: []config.ClaudeKey{{APIKey: "target-provider-key"}},
+			OAuthExcludedModels: map[string][]string{
+				"codex": {"legacy-hidden-model"},
+			},
+			OAuthModelAlias: map[string][]config.OAuthModelAlias{
+				"codex": {{
+					Name:  "legacy-upstream-model",
+					Alias: "legacy-client-model",
+					Fork:  true,
+				}},
+			},
+			Payload: config.PayloadConfig{
+				Override: []config.PayloadRule{{
+					Models: []config.PayloadModelRule{{Name: "legacy-model"}},
+					Params: map[string]any{"reasoning.effort": "legacy"},
+				}},
+				Filter: []config.PayloadFilterRule{{
+					Models: []config.PayloadModelRule{{Name: "legacy-model"}},
+					Params: []string{"response_format"},
+				}},
+			},
 			Debug:     false,
 			Home: config.HomeConfig{
 				Enabled: true,
@@ -207,6 +227,12 @@ func TestPutFunctionalConfigPreservesTargetSecretsAndEnvironment(t *testing.T) {
 	}
 	if h.cfg.GPTImage2BaseModel != "" {
 		t.Fatalf("omitted functional field was not reset: gpt-image-2-base-model=%q", h.cfg.GPTImage2BaseModel)
+	}
+	if len(h.cfg.OAuthExcludedModels) != 0 || len(h.cfg.OAuthModelAlias) != 0 {
+		t.Fatalf("omitted OAuth functional fields were not reset: excluded=%v aliases=%v", h.cfg.OAuthExcludedModels, h.cfg.OAuthModelAlias)
+	}
+	if len(h.cfg.Payload.Filter) != 0 {
+		t.Fatalf("omitted payload filter was not reset: %#v", h.cfg.Payload.Filter)
 	}
 	if h.cfg.ProxyURL != "http://target-proxy.invalid" ||
 		len(h.cfg.APIKeys) != 1 || h.cfg.APIKeys[0] != "target-client-key" ||
