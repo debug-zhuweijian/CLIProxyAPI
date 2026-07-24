@@ -18,6 +18,10 @@ type PayloadConfig = internalconfig.PayloadConfig
 type PayloadRule = internalconfig.PayloadRule
 type PayloadFilterRule = internalconfig.PayloadFilterRule
 type PayloadModelRule = internalconfig.PayloadModelRule
+type ModelPolicyConfig = internalconfig.ModelPolicyConfig
+type ModelPolicyRule = internalconfig.ModelPolicyRule
+type ModelPolicyContextSignal = internalconfig.ModelPolicyContextSignal
+type ManagementAPICallRule = internalconfig.ManagementAPICallRule
 
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey

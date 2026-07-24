@@ -3,6 +3,7 @@ package auth
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelpolicy"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -520,6 +522,123 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if clearedCooldowns {
 		m.persistCooldownStates(context.Background())
 	}
+}
+
+func (m *Manager) modelExecutionApproval(auth *Auth, provider string, executor ProviderExecutor, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (modelpolicy.Approval, bool, error) {
+	if m == nil {
+		return modelpolicy.Approval{}, false, nil
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || !modelpolicy.Enabled(cfg.ModelPolicy) {
+		return modelpolicy.Approval{}, false, nil
+	}
+	canonical := metadataString(opts.Metadata, modelpolicy.CanonicalModelMetadataKey)
+	protocol := opts.SourceFormat.String()
+	if err := modelpolicy.ValidateFinal(cfg.ModelPolicy, protocol, canonical, req.Model); err != nil {
+		return modelpolicy.Approval{}, true, err
+	}
+	payloadModel, err := modelpolicy.ValidatePayloadModel(protocol, canonical, req.Model, req.Payload)
+	if err != nil {
+		return modelpolicy.Approval{}, true, err
+	}
+	kind, identityHash := modelPolicyAuthIdentity(auth)
+	executorKind := ""
+	if executor != nil {
+		executorKind = strings.TrimSpace(executor.Identifier())
+	}
+	approval := modelpolicy.Approval{
+		Protocol:         modelpolicy.NormalizeProtocol(protocol),
+		Provider:         strings.ToLower(strings.TrimSpace(provider)),
+		AuthIdentityKind: kind,
+		AuthIdentityHash: identityHash,
+		ExecutorKind:     executorKind,
+		Canonical:        canonical,
+		UpstreamModel:    req.Model,
+		ContextMode:      metadataString(opts.Metadata, modelpolicy.ContextModeMetadataKey),
+		PayloadModel:     payloadModel,
+	}
+	return approval, true, nil
+}
+
+func (m *Manager) sealModelExecution(auth *Auth, provider string, executor ProviderExecutor, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Options, error) {
+	approval, enabled, err := m.modelExecutionApproval(auth, provider, executor, req, opts)
+	if err != nil || !enabled {
+		return opts, err
+	}
+	opts.ModelPolicyApprovalHash = approval.Hash()
+	return opts, nil
+}
+
+func (m *Manager) approveModelExecution(auth *Auth, provider string, executor ProviderExecutor, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Options, error) {
+	approval, enabled, err := m.modelExecutionApproval(auth, provider, executor, req, opts)
+	if err != nil || !enabled {
+		return opts, err
+	}
+	expected := strings.TrimSpace(opts.ModelPolicyApprovalHash)
+	if expected == "" {
+		return opts, &modelpolicy.Error{Protocol: opts.SourceFormat.String(), Model: req.Model, Reason: "approved execution tuple is missing"}
+	}
+	actual := approval.Hash()
+	if actual != expected {
+		return opts, &modelpolicy.Error{Protocol: opts.SourceFormat.String(), Model: req.Model, Reason: "approved execution tuple changed after credential selection"}
+	}
+	opts.Metadata = cloneSchedulerAnyMap(opts.Metadata)
+	if opts.Metadata == nil {
+		opts.Metadata = make(map[string]any)
+	}
+	opts.Metadata[modelpolicy.ApprovalHashMetadataKey] = actual
+	return opts, nil
+}
+
+func (m *Manager) executeApproved(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	approved, err := m.approveModelExecution(auth, provider, executor, req, opts)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	return executor.Execute(ctx, auth, req, approved)
+}
+
+func (m *Manager) countApproved(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	approved, err := m.approveModelExecution(auth, provider, executor, req, opts)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	return executor.CountTokens(ctx, auth, req, approved)
+}
+
+func (m *Manager) streamApproved(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	approved, err := m.approveModelExecution(auth, provider, executor, req, opts)
+	if err != nil {
+		return nil, err
+	}
+	return executor.ExecuteStream(ctx, auth, req, approved)
+}
+
+func modelPolicyAuthIdentity(auth *Auth) (string, string) {
+	kind := "missing"
+	value := ""
+	if auth != nil {
+		switch {
+		case strings.TrimSpace(auth.ID) != "":
+			kind, value = "auth-id", strings.TrimSpace(auth.ID)
+		case strings.TrimSpace(auth.Index) != "":
+			kind, value = "auth-index", strings.TrimSpace(auth.Index)
+		case strings.TrimSpace(auth.FileName) != "":
+			kind, value = "auth-file", strings.TrimSpace(auth.FileName)
+		default:
+			kind, value = "provider", strings.TrimSpace(auth.Provider)
+		}
+	}
+	sum := sha256.Sum256([]byte(kind + "\x00" + value))
+	return kind, fmt.Sprintf("%x", sum[:])
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, _ := metadata[key].(string)
+	return strings.TrimSpace(value)
 }
 
 func (m *Manager) cooldownDisabledForAuth(auth *Auth) bool {
@@ -1864,8 +1983,13 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			execReq.Model = executionModel
 		}
 		execOpts := opts
+		var errSeal error
+		execOpts, errSeal = m.sealModelExecution(auth, provider, executor, execReq, execOpts)
+		if errSeal != nil {
+			return nil, errSeal
+		}
 		execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
-		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
+		streamResult, errStream := m.streamApproved(ctx, executor, auth, provider, execReq, execOpts)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -1873,7 +1997,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errStream, didRefreshOnUnauthorized); okRefresh {
 				auth = refreshed
 				didRefreshOnUnauthorized = true
-				streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, execOpts)
+				execOpts, errStream = m.sealModelExecution(auth, provider, executor, execReq, execOpts)
+				if errStream == nil {
+					streamResult, errStream = m.streamApproved(ctx, executor, auth, provider, execReq, execOpts)
+				}
 				if errStream != nil {
 					if errCtx := ctx.Err(); errCtx != nil {
 						return nil, errCtx
@@ -1903,7 +2030,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				discardStreamChunks(streamResult.Chunks)
 				auth = refreshed
 				didRefreshOnUnauthorized = true
-				retryStream, retryErr := executor.ExecuteStream(ctx, auth, execReq, execOpts)
+				execOpts, retryErr := m.sealModelExecution(auth, provider, executor, execReq, execOpts)
+				var retryStream *cliproxyexecutor.StreamResult
+				if retryErr == nil {
+					retryStream, retryErr = m.streamApproved(ctx, executor, auth, provider, execReq, execOpts)
+				}
 				if retryErr != nil {
 					if errCtx := ctx.Err(); errCtx != nil {
 						return nil, errCtx
@@ -2597,8 +2728,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				execReq.Model = executionModel
 			}
 			execOpts := opts
+			var errSeal error
+			execOpts, errSeal = m.sealModelExecution(auth, provider, executor, execReq, execOpts)
+			if errSeal != nil {
+				return cliproxyexecutor.Response{}, errSeal
+			}
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
-			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+			resp, errExec := m.executeApproved(execCtx, executor, auth, provider, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -2606,7 +2742,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
-					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
+					execOpts, errExec = m.sealModelExecution(auth, provider, executor, execReq, execOpts)
+					if errExec == nil {
+						resp, errExec = m.executeApproved(execCtx, executor, auth, provider, execReq, execOpts)
+					}
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
 							return cliproxyexecutor.Response{}, errCtx
@@ -2710,8 +2849,13 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				execReq.Model = executionModel
 			}
 			execOpts := opts
+			var errSeal error
+			execOpts, errSeal = m.sealModelExecution(auth, provider, executor, execReq, execOpts)
+			if errSeal != nil {
+				return cliproxyexecutor.Response{}, errSeal
+			}
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
-			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
+			resp, errExec := m.countApproved(execCtx, executor, auth, provider, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -2719,7 +2863,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
-					resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
+					execOpts, errExec = m.sealModelExecution(auth, provider, executor, execReq, execOpts)
+					if errExec == nil {
+						resp, errExec = m.countApproved(execCtx, executor, auth, provider, execReq, execOpts)
+					}
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
 							return cliproxyexecutor.Response{}, errCtx
@@ -5730,7 +5877,14 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
-			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
+			execOpts, errExec := m.sealModelExecution(c.auth, c.provider, c.executor, execReq, creditsOpts)
+			if errExec == nil {
+				execReq, execOpts = applyRequestAfterAuthInterceptor(creditsCtx, c.executor, c.provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			}
+			var resp cliproxyexecutor.Response
+			if errExec == nil {
+				resp, errExec = m.executeApproved(creditsCtx, c.executor, c.auth, c.provider, execReq, execOpts)
+			}
 			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)

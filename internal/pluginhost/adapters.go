@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelpolicy"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
@@ -1370,6 +1371,11 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
 	nativeReq.Format = outputFormat
 	nativeOpts.SourceFormat = inputFormat
 	nativeOpts.ResponseFormat = outputFormat
+	if strings.TrimSpace(nativeOpts.ModelPolicyApprovalHash) != "" {
+		if err := modelpolicy.ValidateExecutorPayloadModel(inputRequested.String(), nativeReq.Model, nativeReq.Payload); err != nil {
+			return preparedExecutorCall{}, err
+		}
+	}
 
 	return preparedExecutorCall{
 		req:             nativeReq,

@@ -2790,6 +2790,34 @@ func TestExecutorAdapterMethods(t *testing.T) {
 	}
 }
 
+func TestExecutorAdapterRejectsModelPolicyPayloadMutationBeforePlugin(t *testing.T) {
+	called := false
+	host := New()
+	adapter := newCurrentExecutorAdapterForTest(host, "executor-plugin", &fakeExecutor{
+		execute: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+			called = true
+			return pluginapi.ExecutorResponse{}, nil
+		},
+	},
+		[]sdktranslator.Format{sdktranslator.FormatOpenAI},
+		[]sdktranslator.Format{sdktranslator.FormatOpenAI},
+	)
+
+	_, errExecute := adapter.Execute(context.Background(), &coreauth.Auth{}, coreexecutor.Request{
+		Model:   "approved-model",
+		Payload: []byte(`{"model":"mutated-model"}`),
+	}, coreexecutor.Options{
+		SourceFormat:            sdktranslator.FormatOpenAI,
+		ModelPolicyApprovalHash: strings.Repeat("a", 64),
+	})
+	if errExecute == nil || !strings.Contains(errExecute.Error(), "translated executor payload model") {
+		t.Fatalf("Execute() error = %v, want translated model rejection", errExecute)
+	}
+	if called {
+		t.Fatal("plugin executor was called after model-policy payload mutation")
+	}
+}
+
 func TestExecutorAdapterUsesResponseFormatForOutputTranslation(t *testing.T) {
 	claudeResponse := []byte(`{"id":"msg_1","type":"message","model":"claude-test","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`)
 	openAIRequest := []byte(`{"model":"model-1","messages":[{"role":"user","content":"hi"}]}`)

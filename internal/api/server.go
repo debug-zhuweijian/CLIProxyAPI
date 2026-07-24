@@ -33,6 +33,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelpolicy"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -827,6 +828,11 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/config", s.mgmt.GetConfig)
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
+		mgmt.GET("/config/functional", s.mgmt.GetFunctionalConfig)
+		mgmt.PUT("/config/functional", s.mgmt.PutFunctionalConfig)
+		mgmt.GET("/config/static-auth", s.mgmt.GetStaticAuthConfig)
+		mgmt.GET("/config/static-auth/summary", s.mgmt.GetStaticAuthSummary)
+		mgmt.PUT("/config/static-auth", s.mgmt.PutStaticAuthConfig)
 		mgmt.GET("/latest-version", s.mgmt.GetLatestVersion)
 		mgmt.GET("/plugins", s.mgmt.ListPlugins)
 		mgmt.GET("/plugin-store", s.mgmt.ListPluginStore)
@@ -1232,6 +1238,7 @@ func (s *Server) handleHomeCodexClientModels(c *gin.Context) {
 	if !ok {
 		return
 	}
+	entries = s.filterHomeModelEntries("openai-response", entries)
 
 	models := make([]map[string]any, 0, len(entries))
 	for _, entry := range entries {
@@ -1293,6 +1300,11 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 	}
 
 	isClaude := isAnthropicModelsRequest(c)
+	protocol := "openai"
+	if isClaude {
+		protocol = "anthropic"
+	}
+	entries = s.filterHomeModelEntries(protocol, entries)
 
 	if isClaude {
 		out := formatHomeClaudeModels(entries)
@@ -1386,6 +1398,7 @@ func (s *Server) handleHomeGeminiModels(c *gin.Context) {
 	if !ok {
 		return
 	}
+	entries = s.filterHomeModelEntries("gemini", entries)
 
 	c.JSON(http.StatusOK, gin.H{
 		"models": formatHomeGeminiModels(entries),
@@ -1397,6 +1410,7 @@ func (s *Server) handleHomeGeminiModel(c *gin.Context) {
 	if !ok {
 		return
 	}
+	entries = s.filterHomeModelEntries("gemini", entries)
 
 	action := strings.TrimPrefix(c.Param("action"), "/")
 	action = strings.TrimSpace(action)
@@ -1413,6 +1427,27 @@ func (s *Server) handleHomeGeminiModel(c *gin.Context) {
 			Type:    "not_found",
 		},
 	})
+}
+
+func (s *Server) filterHomeModelEntries(protocol string, entries []homeModelEntry) []homeModelEntry {
+	if s == nil || s.cfg == nil || !modelpolicy.Enabled(s.cfg.ModelPolicy) {
+		return entries
+	}
+	filtered := make([]homeModelEntry, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		canonical, ok := modelpolicy.CanonicalizeAvailableModel(s.cfg.ModelPolicy, protocol, entry.id)
+		if !ok {
+			continue
+		}
+		if _, duplicate := seen[canonical]; duplicate {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		entry.id = canonical
+		filtered = append(filtered, entry)
+	}
+	return filtered
 }
 
 func (s *Server) loadHomeModelEntries(c *gin.Context) ([]homeModelEntry, bool) {

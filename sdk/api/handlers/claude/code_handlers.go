@@ -21,6 +21,7 @@ import (
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelpolicy"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -56,6 +57,9 @@ func (h *ClaudeCodeAPIHandler) HandlerType() string {
 
 // Models returns a list of models supported by this handler.
 func (h *ClaudeCodeAPIHandler) Models() []map[string]any {
+	if h != nil && h.Cfg != nil && modelpolicy.Enabled(h.Cfg.ModelPolicy) {
+		return modelpolicy.CatalogForProtocol(h.Cfg.ModelPolicy, "anthropic")
+	}
 	// Get dynamic models from the global registry
 	modelRegistry := registry.GetGlobalRegistry()
 	return modelRegistry.GetAvailableModels("claude")
@@ -82,7 +86,13 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 	}
 
 	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
-	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
+	rawJSON, err = rewriteClaudeDDModelInBody(rawJSON)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{Message: err.Error(), Type: "invalid_request_error"},
+		})
+		return
+	}
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -114,7 +124,13 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 	}
 
 	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
-	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
+	rawJSON, err = rewriteClaudeDDModelInBody(rawJSON)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{Message: err.Error(), Type: "invalid_request_error"},
+		})
+		return
+	}
 
 	c.Header("Content-Type", "application/json")
 
@@ -136,17 +152,20 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 
 // rewriteClaudeDDModelInBody decodes model IDs of the form claude-fable-5-dd-<reversed>
 // back into the original model name used for routing and upstream requests.
-func rewriteClaudeDDModelInBody(rawJSON []byte) []byte {
+func rewriteClaudeDDModelInBody(rawJSON []byte) ([]byte, error) {
 	modelName := gjson.GetBytes(rawJSON, "model").String()
-	resolved := util.ResolveClaudeModelIDPrefix(modelName)
-	if resolved == modelName {
-		return rawJSON
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(modelName)), "claude-fable-5-dd-") {
+		return rawJSON, nil
+	}
+	resolved, errResolve := util.ResolveClaudeModelIDPrefixStrict(modelName)
+	if errResolve != nil {
+		return nil, fmt.Errorf("invalid Claude model ID: %w", errResolve)
 	}
 	updated, errSet := sjson.SetBytes(rawJSON, "model", resolved)
 	if errSet != nil {
-		return rawJSON
+		return nil, fmt.Errorf("rewrite Claude model ID: %w", errSet)
 	}
-	return updated
+	return updated, nil
 }
 
 // ClaudeModels handles the Claude models listing endpoint.

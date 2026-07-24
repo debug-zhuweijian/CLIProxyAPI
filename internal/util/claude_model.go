@@ -1,6 +1,9 @@
 package util
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // IsClaudeThinkingModel checks if the model is a Claude thinking model
 // that requires the interleaved-thinking beta header.
@@ -44,6 +47,29 @@ func ResolveClaudeModelIDPrefix(id string) string {
 		return resolved + "(" + suffix + ")"
 	}
 	return resolved
+}
+
+// ResolveClaudeModelIDPrefixStrict decodes only canonical reversible fable IDs.
+// Re-encoding the decoded model must reproduce the original wire ID exactly,
+// ignoring only surrounding whitespace and ASCII letter case.
+func ResolveClaudeModelIDPrefixStrict(id string) (string, error) {
+	trimmed := strings.TrimSpace(id)
+	resolved := ResolveClaudeModelIDPrefix(trimmed)
+	if resolved == trimmed {
+		return "", fmt.Errorf("model is not a reversible Claude fable ID")
+	}
+	base, suffix, hasSuffix := splitModelThinkingSuffix(resolved)
+	if strings.ContainsAny(resolved, "()") && (!hasSuffix || strings.TrimSpace(suffix) == "") {
+		return "", fmt.Errorf("Claude fable model ID has an invalid thinking suffix")
+	}
+	reencoded := EnsureClaudeModelIDPrefix(resolved)
+	if hasSuffix {
+		reencoded = EnsureClaudeModelIDPrefix(base) + "(" + suffix + ")"
+	}
+	if !strings.EqualFold(reencoded, trimmed) {
+		return "", fmt.Errorf("Claude fable model ID failed round-trip validation")
+	}
+	return resolved, nil
 }
 
 func splitModelThinkingSuffix(model string) (base, suffix string, hasSuffix bool) {

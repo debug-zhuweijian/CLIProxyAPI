@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -115,6 +116,10 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid url"})
 		return
 	}
+	if errPolicy := h.validateAPICallPolicy(method, parsedURL, body); errPolicy != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errPolicy.Error()})
+		return
+	}
 
 	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
 	auth := h.authByIndex(authIndex)
@@ -175,6 +180,11 @@ func (h *Handler) APICall(c *gin.Context) {
 	httpClient := &http.Client{
 		Timeout: defaultAPICallTimeout,
 	}
+	if h.strictModelPolicyEnabled() {
+		httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
 	httpClient.Transport = h.apiCallTransport(auth)
 
 	resp, errDo := httpClient.Do(req)
@@ -200,6 +210,79 @@ func (h *Handler) APICall(c *gin.Context) {
 		Header:     resp.Header,
 		Body:       string(respBody),
 	})
+}
+
+func (h *Handler) validateAPICallPolicy(method string, target *url.URL, body apiCallRequest) error {
+	if !h.strictModelPolicyEnabled() {
+		return nil
+	}
+	if target == nil || !strings.EqualFold(target.Scheme, "https") && !isLoopbackAPICallHost(target.Hostname()) {
+		return fmt.Errorf("api-call destination must use HTTPS")
+	}
+	if target.User != nil || strings.TrimSpace(target.Fragment) != "" {
+		return fmt.Errorf("api-call destination contains unsupported URL components")
+	}
+	if strings.TrimSpace(body.Data) != "" {
+		return fmt.Errorf("api-call request bodies are not allowed in configured-only mode")
+	}
+	for key := range body.Header {
+		if strings.EqualFold(strings.TrimSpace(key), "host") {
+			return fmt.Errorf("api-call Host override is not allowed in configured-only mode")
+		}
+	}
+
+	cleanPath := path.Clean("/" + strings.TrimPrefix(target.EscapedPath(), "/"))
+	if isInferenceAPICallPath(cleanPath) {
+		return fmt.Errorf("api-call cannot access model inference endpoints")
+	}
+	host := strings.ToLower(strings.TrimSpace(target.Host))
+	for _, rule := range h.cfg.RemoteManagement.APICallAllowlist {
+		if !strings.EqualFold(strings.TrimSpace(rule.Host), host) {
+			continue
+		}
+		prefix := path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(rule.PathPrefix), "/"))
+		if prefix == "/" || !pathPrefixMatches(cleanPath, prefix) {
+			continue
+		}
+		for _, allowedMethod := range rule.Methods {
+			if strings.EqualFold(strings.TrimSpace(allowedMethod), method) {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("api-call destination is not in configured allowlist")
+}
+
+func (h *Handler) strictModelPolicyEnabled() bool {
+	return h != nil && h.cfg != nil && strings.EqualFold(strings.TrimSpace(h.cfg.ModelPolicy.Mode), "configured-only")
+}
+
+func isLoopbackAPICallHost(host string) bool {
+	return strings.EqualFold(strings.TrimSpace(host), "localhost") || strings.TrimSpace(host) == "127.0.0.1" || strings.TrimSpace(host) == "::1"
+}
+
+func pathPrefixMatches(value, prefix string) bool {
+	return value == prefix || strings.HasPrefix(value, strings.TrimSuffix(prefix, "/")+"/")
+}
+
+func isInferenceAPICallPath(requestPath string) bool {
+	lower := strings.ToLower(requestPath)
+	blocked := []string{
+		"/v1/chat/completions",
+		"/v1/completions",
+		"/v1/responses",
+		"/v1/messages",
+		"/v1/images",
+		"/generatecontent",
+		"/streamgeneratecontent",
+		"/backend-api/codex/responses",
+	}
+	for _, candidate := range blocked {
+		if strings.Contains(lower, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func firstNonEmptyString(values ...*string) string {

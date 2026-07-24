@@ -471,6 +471,41 @@ nonstream-keepalive-interval: 0
 #   xai:
 #     - "grok-3-mini"
 
+# Optional fail-closed model catalog and protocol admission policy.
+# When enabled, only configured canonical models are published and accepted.
+# model-policy:
+#   mode: "configured-only"
+#   catalog-allowlist:
+#     - "glm-5.2[1m]"
+#     - "gpt-5.6-sol"
+#   protocol-rules:
+#     anthropic:
+#       - wire-model: "glm-5.2"
+#         canonical: "glm-5.2[1m]"
+#         upstream-model: "glm-5.2"
+#         require-context-signal:
+#           header: "anthropic-beta"
+#           contains: "context-1m-2025-08-07"
+#       - wire-model: "glm-5.2[1m]"
+#         canonical: "glm-5.2[1m]"
+#         upstream-model: "glm-5.2"
+#         explicit-context-suffix: true
+#       - wire-model: "gpt-5.6-sol"
+#         canonical: "gpt-5.6-sol"
+#         upstream-model: "gpt-5.6-sol"
+#     openai:
+#       - wire-model: "glm-5.2[1m]"
+#         canonical: "glm-5.2[1m]"
+#         upstream-model: "glm-5.2"
+#         explicit-context-suffix: true
+#       - wire-model: "gpt-5.6-sol"
+#         canonical: "gpt-5.6-sol"
+#         upstream-model: "gpt-5.6-sol"
+#     openai-response:
+#       - wire-model: "gpt-5.6-sol"
+#         canonical: "gpt-5.6-sol"
+#         upstream-model: "gpt-5.6-sol"
+
 # Optional payload configuration
 # payload:
 #   default: # Default rules only set parameters when they are missing in the payload.

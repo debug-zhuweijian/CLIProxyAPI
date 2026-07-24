@@ -1340,6 +1340,38 @@ func TestFormatHomeClaudeModelsSortsByDisplayName(t *testing.T) {
 	}
 }
 
+func TestFilterHomeModelEntriesUsesConfiguredPolicy(t *testing.T) {
+	server := &Server{cfg: &proxyconfig.Config{}}
+	server.cfg.ModelPolicy = proxyconfig.ModelPolicyConfig{
+		Mode:             "configured-only",
+		CatalogAllowlist: []string{"glm-5.2[1m]", "gpt-5.6-sol"},
+		ProtocolRules: map[string][]proxyconfig.ModelPolicyRule{
+			"anthropic": {{
+				WireModel:     "glm-5.2[1m]",
+				Canonical:     "glm-5.2[1m]",
+				UpstreamModel: "glm-5.2",
+			}},
+			"openai-response": {{
+				WireModel:     "gpt-5.6-sol",
+				Canonical:     "gpt-5.6-sol",
+				UpstreamModel: "gpt-5.6-sol",
+			}},
+		},
+	}
+	entries := []homeModelEntry{
+		{id: "glm-5.2"},
+		{id: "glm-5.2[1m]"},
+		{id: "third-model"},
+	}
+	filtered := server.filterHomeModelEntries("anthropic", entries)
+	if len(filtered) != 1 || filtered[0].id != "glm-5.2[1m]" {
+		t.Fatalf("filtered entries = %#v, want one canonical GLM model", filtered)
+	}
+	if got := server.filterHomeModelEntries("gemini", entries); len(got) != 0 {
+		t.Fatalf("gemini filtered entries = %#v, want none", got)
+	}
+}
+
 func TestDecodeHomeModelsKeepsTokenMetadata(t *testing.T) {
 	entries, errDecode := decodeHomeModels([]byte(`{
 		"claude": [

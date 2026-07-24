@@ -94,10 +94,19 @@ func TestRewriteClaudeDDModelInBody(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := rewriteClaudeDDModelInBody([]byte(tt.body))
+			got, err := rewriteClaudeDDModelInBody([]byte(tt.body))
+			if err != nil {
+				t.Fatalf("rewriteClaudeDDModelInBody() error = %v", err)
+			}
 			if model := gjson.GetBytes(got, "model").String(); model != tt.wantModel {
 				t.Fatalf("model = %q, want %q; body=%s", model, tt.wantModel, string(got))
 			}
 		})
+	}
+}
+
+func TestRewriteClaudeDDModelInBodyRejectsMalformedFableID(t *testing.T) {
+	if _, err := rewriteClaudeDDModelInBody([]byte(`{"model":"claude-fable-5-dd-"}`)); err == nil {
+		t.Fatal("rewriteClaudeDDModelInBody accepted malformed fable ID")
 	}
 }

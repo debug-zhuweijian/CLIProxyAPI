@@ -88,3 +88,23 @@ func TestResolveClaudeModelIDPrefix(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveClaudeModelIDPrefixStrict(t *testing.T) {
+	wire := EnsureClaudeModelIDPrefix("glm-5.2[1m]")
+	got, err := ResolveClaudeModelIDPrefixStrict(wire)
+	if err != nil {
+		t.Fatalf("ResolveClaudeModelIDPrefixStrict() error = %v", err)
+	}
+	if got != "glm-5.2[1m]" {
+		t.Fatalf("resolved = %q, want glm-5.2[1m]", got)
+	}
+	for _, invalid := range []string{
+		"glm-5.2[1m]",
+		"claude-fable-5-dd-",
+		"claude-fable-5-dd-o4-tpg(extra",
+	} {
+		if _, err = ResolveClaudeModelIDPrefixStrict(invalid); err == nil {
+			t.Fatalf("strict decoder accepted %q", invalid)
+		}
+	}
+}

@@ -2,13 +2,107 @@ package management
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
+
+func TestAPICallConfiguredOnlyPolicy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	target, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+	h := &Handler{cfg: &config.Config{
+		SDKConfig: config.SDKConfig{ModelPolicy: config.ModelPolicyConfig{Mode: "configured-only"}},
+		RemoteManagement: config.RemoteManagement{APICallAllowlist: []config.ManagementAPICallRule{{
+			Host:       target.Host,
+			PathPrefix: "/backend-api/wham/usage",
+			Methods:    []string{http.MethodGet},
+		}}},
+	}}
+	h.cfg.ProxyURL = ""
+
+	tests := []struct {
+		name       string
+		request    apiCallRequest
+		wantStatus int
+	}{
+		{
+			name: "allowlisted quota query",
+			request: apiCallRequest{
+				Method: http.MethodGet,
+				URL:    upstream.URL + "/backend-api/wham/usage",
+			},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name: "unknown path",
+			request: apiCallRequest{
+				Method: http.MethodGet,
+				URL:    upstream.URL + "/unknown",
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "inference path remains blocked even when host is allowed",
+			request: apiCallRequest{
+				Method: http.MethodGet,
+				URL:    upstream.URL + "/v1/responses",
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "body is blocked",
+			request: apiCallRequest{
+				Method: http.MethodGet,
+				URL:    upstream.URL + "/backend-api/wham/usage",
+				Data:   `{"model":"gpt-5.6-sol"}`,
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "host override is blocked",
+			request: apiCallRequest{
+				Method: http.MethodGet,
+				URL:    upstream.URL + "/backend-api/wham/usage",
+				Header: map[string]string{"Host": "example.com"},
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, errMarshal := json.Marshal(test.request)
+			if errMarshal != nil {
+				t.Fatalf("marshal request: %v", errMarshal)
+			}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(string(payload)))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+
+			h.APICall(ctx)
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, test.wantStatus, recorder.Body.String())
+			}
+		})
+	}
+}
 
 func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	t.Parallel()

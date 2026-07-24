@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelpolicy"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -77,6 +78,7 @@ type interceptorCaptureExecutor struct {
 	provider string
 
 	mu           sync.Mutex
+	calls        int
 	lastRequest  coreexecutor.Request
 	lastOptions  coreexecutor.Options
 	execute      func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error)
@@ -128,6 +130,7 @@ func (e *interceptorCaptureExecutor) HttpRequest(ctx context.Context, auth *core
 func (e *interceptorCaptureExecutor) capture(req coreexecutor.Request, opts coreexecutor.Options) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.calls++
 	e.lastRequest = coreexecutor.Request{
 		Model:    req.Model,
 		Payload:  cloneBytes(req.Payload),
@@ -145,6 +148,12 @@ func (e *interceptorCaptureExecutor) capture(req coreexecutor.Request, opts core
 	}
 }
 
+func (e *interceptorCaptureExecutor) callCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
+}
+
 func (e *interceptorCaptureExecutor) captured() (coreexecutor.Request, coreexecutor.Options) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -154,6 +163,7 @@ func (e *interceptorCaptureExecutor) captured() (coreexecutor.Request, coreexecu
 func newInterceptorHandler(t *testing.T, model string, executor *interceptorCaptureExecutor, cfg *sdkconfig.SDKConfig) *BaseAPIHandler {
 	t.Helper()
 	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(&sdkconfig.Config{SDKConfig: *cfg})
 	manager.RegisterExecutor(executor)
 	auth := &coreauth.Auth{
 		ID:       "handler-interceptor-" + model,
@@ -169,6 +179,25 @@ func newInterceptorHandler(t *testing.T, model string, executor *interceptorCapt
 		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
 	})
 	return NewBaseAPIHandlers(cfg, manager)
+}
+
+func strictInterceptorModelPolicyConfig() *sdkconfig.SDKConfig {
+	const (
+		firstModel  = "handler-policy-model-a"
+		secondModel = "handler-policy-model-b"
+	)
+	return &sdkconfig.SDKConfig{
+		ModelPolicy: sdkconfig.ModelPolicyConfig{
+			Mode:             modelpolicy.ModeConfiguredOnly,
+			CatalogAllowlist: []string{firstModel, secondModel},
+			ProtocolRules: map[string][]sdkconfig.ModelPolicyRule{
+				"openai": {
+					{WireModel: firstModel, Canonical: firstModel, UpstreamModel: firstModel},
+					{WireModel: secondModel, Canonical: secondModel, UpstreamModel: secondModel},
+				},
+			},
+		},
+	}
 }
 
 func contextWithHeaders(headers http.Header) context.Context {
@@ -365,6 +394,113 @@ func TestHandlerRequestInterceptorAfterAuthRewritesExecutorRequest(t *testing.T)
 	}
 	if !responseChecked {
 		t.Fatal("response interceptor was not called")
+	}
+}
+
+func TestHandlerModelPolicyRejectsAfterAuthModelMutationBeforeExecutor(t *testing.T) {
+	const (
+		firstModel  = "handler-policy-model-a"
+		secondModel = "handler-policy-model-b"
+		thirdModel  = "handler-policy-model-c"
+	)
+	tests := []struct {
+		name         string
+		mutatedModel string
+		execute      func(*BaseAPIHandler) *interfaces.ErrorMessage
+	}{
+		{
+			name:         "execute rejects unconfigured model",
+			mutatedModel: thirdModel,
+			execute: func(handler *BaseAPIHandler) *interfaces.ErrorMessage {
+				_, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", firstModel, []byte(`{"model":"handler-policy-model-a","input":"before"}`), "")
+				return errMsg
+			},
+		},
+		{
+			name:         "count rejects unconfigured model",
+			mutatedModel: thirdModel,
+			execute: func(handler *BaseAPIHandler) *interfaces.ErrorMessage {
+				_, _, errMsg := handler.ExecuteCountWithAuthManager(context.Background(), "openai", firstModel, []byte(`{"model":"handler-policy-model-a","input":"before"}`), "")
+				return errMsg
+			},
+		},
+		{
+			name:         "stream rejects unconfigured model",
+			mutatedModel: thirdModel,
+			execute: func(handler *BaseAPIHandler) *interfaces.ErrorMessage {
+				dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", firstModel, []byte(`{"model":"handler-policy-model-a","input":"before"}`), "")
+				if dataChan != nil {
+					for range dataChan {
+					}
+				}
+				var got *interfaces.ErrorMessage
+				for errMsg := range errChan {
+					if errMsg != nil {
+						got = errMsg
+					}
+				}
+				return got
+			},
+		},
+		{
+			name:         "execute rejects another configured canonical model",
+			mutatedModel: secondModel,
+			execute: func(handler *BaseAPIHandler) *interfaces.ErrorMessage {
+				_, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", firstModel, []byte(`{"model":"handler-policy-model-a","input":"before"}`), "")
+				return errMsg
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &interceptorCaptureExecutor{}
+			handler := newInterceptorHandler(t, firstModel, executor, strictInterceptorModelPolicyConfig())
+			handler.SetPluginHost(&handlerInterceptorTestHost{
+				interceptRequestAfterAuth: func(ctx context.Context, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+					return pluginapi.RequestInterceptResponse{
+						Headers: cloneHeader(req.Headers),
+						Body:    []byte(fmt.Sprintf(`{"model":%q,"input":"after"}`, tt.mutatedModel)),
+					}
+				},
+			})
+
+			if errMsg := tt.execute(handler); errMsg == nil {
+				t.Fatal("model policy accepted an after-auth model mutation")
+			}
+			if calls := executor.callCount(); calls != 0 {
+				t.Fatalf("after-auth model mutation reached executor %d time(s)", calls)
+			}
+		})
+	}
+}
+
+func TestHandlerModelPolicyAllowsAfterAuthNonModelMutation(t *testing.T) {
+	const model = "handler-policy-model-a"
+	executor := &interceptorCaptureExecutor{}
+	handler := newInterceptorHandler(t, model, executor, strictInterceptorModelPolicyConfig())
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		interceptRequestAfterAuth: func(ctx context.Context, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+			return pluginapi.RequestInterceptResponse{
+				Headers: cloneHeader(req.Headers),
+				Body:    []byte(`{"model":"handler-policy-model-a","input":"after"}`),
+			}
+		},
+	})
+
+	body, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", model, []byte(`{"model":"handler-policy-model-a","input":"before"}`), "")
+	if errMsg != nil {
+		t.Fatalf("ExecuteWithAuthManager() error = %+v", errMsg)
+	}
+	if string(body) != "ok" {
+		t.Fatalf("body = %q, want ok", body)
+	}
+	if calls := executor.callCount(); calls != 1 {
+		t.Fatalf("executor calls = %d, want 1", calls)
+	}
+	gotReq, _ := executor.captured()
+	if got := string(gotReq.Payload); got != `{"model":"handler-policy-model-a","input":"after"}` {
+		t.Fatalf("executor payload = %q, want non-model mutation", got)
 	}
 }
 

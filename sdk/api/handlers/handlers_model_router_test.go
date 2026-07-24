@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelpolicy"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -89,9 +91,13 @@ type handlerDirectExecutorRouteHost struct {
 	lastPluginID string
 	lastRequest  coreexecutor.Request
 	lastOptions  coreexecutor.Options
+	executeCalls int
+	streamCalls  int
+	countCalls   int
 }
 
 func (h *handlerDirectExecutorRouteHost) ExecutePluginExecutor(ctx context.Context, pluginID string, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
+	h.executeCalls++
 	h.lastPluginID = pluginID
 	h.lastRequest = req
 	h.lastOptions = opts
@@ -99,6 +105,7 @@ func (h *handlerDirectExecutorRouteHost) ExecutePluginExecutor(ctx context.Conte
 }
 
 func (h *handlerDirectExecutorRouteHost) ExecutePluginExecutorStream(ctx context.Context, pluginID string, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	h.streamCalls++
 	h.lastPluginID = pluginID
 	h.lastRequest = req
 	h.lastOptions = opts
@@ -109,6 +116,7 @@ func (h *handlerDirectExecutorRouteHost) ExecutePluginExecutorStream(ctx context
 }
 
 func (h *handlerDirectExecutorRouteHost) CountPluginExecutor(ctx context.Context, pluginID string, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
+	h.countCalls++
 	h.lastPluginID = pluginID
 	h.lastRequest = req
 	h.lastOptions = opts
@@ -119,6 +127,7 @@ type handlerDirectExecutorInterceptorHost struct {
 	handlerDirectExecutorRouteHost
 	afterAuthCalled bool
 	afterAuthReq    pluginapi.RequestInterceptRequest
+	afterAuthBody   []byte
 }
 
 func (h *handlerDirectExecutorInterceptorHost) HasRequestInterceptors() bool { return true }
@@ -137,7 +146,11 @@ func (h *handlerDirectExecutorInterceptorHost) InterceptRequestAfterAuth(ctx con
 		headers = make(http.Header)
 	}
 	headers.Set("X-After-Auth", "yes")
-	return pluginapi.RequestInterceptResponse{Headers: headers, Body: []byte(`{"after":true}`)}
+	body := h.afterAuthBody
+	if len(body) == 0 {
+		body = []byte(`{"after":true}`)
+	}
+	return pluginapi.RequestInterceptResponse{Headers: headers, Body: cloneBytes(body)}
 }
 
 func (h *handlerDirectExecutorInterceptorHost) InterceptResponse(ctx context.Context, req pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse {
@@ -277,6 +290,243 @@ func TestHandlerModelRouterCanTargetPluginExecutorWithoutChangingModel(t *testin
 	}
 	if host.lastOptions.Metadata[coreexecutor.RequestedModelMetadataKey] != originalModel {
 		t.Fatalf("requested model metadata = %#v, want original model", host.lastOptions.Metadata[coreexecutor.RequestedModelMetadataKey])
+	}
+}
+
+func TestHandlerModelPolicyMapsPluginExecutorToApprovedUpstreamModel(t *testing.T) {
+	const (
+		canonicalModel = "glm-5.2[1m]"
+		upstreamModel  = "glm-5.2"
+		targetPluginID = "model-policy-plugin"
+	)
+	host := &handlerDirectExecutorRouteHost{}
+	host.hasRouters = true
+	host.route = func(ctx context.Context, req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+		if req.RequestedModel != canonicalModel {
+			t.Fatalf("router model = %q, want canonical %q", req.RequestedModel, canonicalModel)
+		}
+		return pluginapi.ModelRouteResponse{
+			Handled:    true,
+			TargetKind: pluginapi.ModelRouteTargetExecutor,
+			Target:     targetPluginID,
+		}, true
+	}
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		ModelPolicy: sdkconfig.ModelPolicyConfig{
+			Mode:             modelpolicy.ModeConfiguredOnly,
+			CatalogAllowlist: []string{canonicalModel},
+			ProtocolRules: map[string][]sdkconfig.ModelPolicyRule{
+				"openai": {
+					{
+						WireModel:             canonicalModel,
+						Canonical:             canonicalModel,
+						UpstreamModel:         upstreamModel,
+						ExplicitContextSuffix: true,
+					},
+				},
+			},
+		},
+	}, nil)
+	handler.SetModelRouterHost(host)
+	rawJSON := []byte(`{"model":"glm-5.2[1m]","input":"test"}`)
+
+	t.Run("execute", func(t *testing.T) {
+		body, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", canonicalModel, rawJSON, "")
+		if errMsg != nil {
+			t.Fatalf("ExecuteWithAuthManager() error = %+v", errMsg)
+		}
+		if string(body) != "direct-ok" {
+			t.Fatalf("body = %q, want direct-ok", body)
+		}
+		assertPluginModelPolicyRequest(t, host, canonicalModel, upstreamModel)
+	})
+
+	t.Run("count", func(t *testing.T) {
+		body, _, errMsg := handler.ExecuteCountWithAuthManager(context.Background(), "openai", canonicalModel, rawJSON, "")
+		if errMsg != nil {
+			t.Fatalf("ExecuteCountWithAuthManager() error = %+v", errMsg)
+		}
+		if string(body) != "7" {
+			t.Fatalf("body = %q, want 7", body)
+		}
+		assertPluginModelPolicyRequest(t, host, canonicalModel, upstreamModel)
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", canonicalModel, rawJSON, "")
+		var chunks []byte
+		for chunk := range dataChan {
+			chunks = append(chunks, chunk...)
+		}
+		for errMsg := range errChan {
+			if errMsg != nil {
+				t.Fatalf("ExecuteStreamWithAuthManager() error = %+v", errMsg)
+			}
+		}
+		if string(chunks) != "direct-stream" {
+			t.Fatalf("stream body = %q, want direct-stream", chunks)
+		}
+		assertPluginModelPolicyRequest(t, host, canonicalModel, upstreamModel)
+	})
+}
+
+func TestHandlerModelPolicyRejectsPluginAfterAuthModelMutation(t *testing.T) {
+	const (
+		canonicalModel = "glm-5.2[1m]"
+		upstreamModel  = "glm-5.2"
+		otherCanonical = "gpt-5.6-sol"
+		targetPluginID = "model-policy-plugin"
+	)
+	tests := []struct {
+		name         string
+		mutatedModel string
+		execute      func(*BaseAPIHandler) *interfaces.ErrorMessage
+	}{
+		{
+			name:         "execute rejects unconfigured model",
+			mutatedModel: "unexpected-model",
+			execute: func(handler *BaseAPIHandler) *interfaces.ErrorMessage {
+				_, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", canonicalModel, []byte(`{"model":"glm-5.2[1m]","input":"before"}`), "")
+				return errMsg
+			},
+		},
+		{
+			name:         "count rejects unconfigured model",
+			mutatedModel: "unexpected-model",
+			execute: func(handler *BaseAPIHandler) *interfaces.ErrorMessage {
+				_, _, errMsg := handler.ExecuteCountWithAuthManager(context.Background(), "openai", canonicalModel, []byte(`{"model":"glm-5.2[1m]","input":"before"}`), "")
+				return errMsg
+			},
+		},
+		{
+			name:         "stream rejects unconfigured model",
+			mutatedModel: "unexpected-model",
+			execute: func(handler *BaseAPIHandler) *interfaces.ErrorMessage {
+				dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", canonicalModel, []byte(`{"model":"glm-5.2[1m]","input":"before"}`), "")
+				if dataChan != nil {
+					for range dataChan {
+					}
+				}
+				var got *interfaces.ErrorMessage
+				for errMsg := range errChan {
+					if errMsg != nil {
+						got = errMsg
+					}
+				}
+				return got
+			},
+		},
+		{
+			name:         "execute rejects another configured canonical model",
+			mutatedModel: otherCanonical,
+			execute: func(handler *BaseAPIHandler) *interfaces.ErrorMessage {
+				_, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", canonicalModel, []byte(`{"model":"glm-5.2[1m]","input":"before"}`), "")
+				return errMsg
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			host := &handlerDirectExecutorInterceptorHost{
+				afterAuthBody: []byte(fmt.Sprintf(`{"model":%q,"input":"after"}`, tt.mutatedModel)),
+			}
+			host.hasRouters = true
+			host.route = func(ctx context.Context, req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+				return pluginapi.ModelRouteResponse{
+					Handled:    true,
+					TargetKind: pluginapi.ModelRouteTargetExecutor,
+					Target:     targetPluginID,
+				}, true
+			}
+			handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+				ModelPolicy: sdkconfig.ModelPolicyConfig{
+					Mode:             modelpolicy.ModeConfiguredOnly,
+					CatalogAllowlist: []string{canonicalModel, otherCanonical},
+					ProtocolRules: map[string][]sdkconfig.ModelPolicyRule{
+						"openai": {
+							{WireModel: canonicalModel, Canonical: canonicalModel, UpstreamModel: upstreamModel, ExplicitContextSuffix: true},
+							{WireModel: otherCanonical, Canonical: otherCanonical, UpstreamModel: otherCanonical},
+						},
+					},
+				},
+			}, nil)
+			handler.SetPluginHost(host)
+
+			if errMsg := tt.execute(handler); errMsg == nil {
+				t.Fatal("model policy accepted a plugin after-auth model mutation")
+			}
+			if !host.afterAuthCalled {
+				t.Fatal("after-auth interceptor was not called")
+			}
+			if host.executeCalls != 0 || host.countCalls != 0 || host.streamCalls != 0 {
+				t.Fatalf("model mutation reached plugin executor: execute=%d count=%d stream=%d", host.executeCalls, host.countCalls, host.streamCalls)
+			}
+		})
+	}
+}
+
+func TestHandlerModelPolicyAllowsPluginAfterAuthNonModelMutation(t *testing.T) {
+	const (
+		canonicalModel = "glm-5.2[1m]"
+		upstreamModel  = "glm-5.2"
+		targetPluginID = "model-policy-plugin"
+	)
+	host := &handlerDirectExecutorInterceptorHost{
+		afterAuthBody: []byte(`{"model":"glm-5.2","input":"after"}`),
+	}
+	host.hasRouters = true
+	host.route = func(ctx context.Context, req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+		return pluginapi.ModelRouteResponse{
+			Handled:    true,
+			TargetKind: pluginapi.ModelRouteTargetExecutor,
+			Target:     targetPluginID,
+		}, true
+	}
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		ModelPolicy: sdkconfig.ModelPolicyConfig{
+			Mode:             modelpolicy.ModeConfiguredOnly,
+			CatalogAllowlist: []string{canonicalModel},
+			ProtocolRules: map[string][]sdkconfig.ModelPolicyRule{
+				"openai": {
+					{WireModel: canonicalModel, Canonical: canonicalModel, UpstreamModel: upstreamModel, ExplicitContextSuffix: true},
+				},
+			},
+		},
+	}, nil)
+	handler.SetPluginHost(host)
+
+	body, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", canonicalModel, []byte(`{"model":"glm-5.2[1m]","input":"before"}`), "")
+	if errMsg != nil {
+		t.Fatalf("ExecuteWithAuthManager() error = %+v", errMsg)
+	}
+	if string(body) != "direct-ok" {
+		t.Fatalf("body = %q, want direct-ok", body)
+	}
+	if host.executeCalls != 1 || host.countCalls != 0 || host.streamCalls != 0 {
+		t.Fatalf("plugin calls = execute:%d count:%d stream:%d, want execute once", host.executeCalls, host.countCalls, host.streamCalls)
+	}
+	if got := string(host.lastRequest.Payload); got != `{"model":"glm-5.2","input":"after"}` {
+		t.Fatalf("plugin executor payload = %q, want non-model mutation", got)
+	}
+}
+
+func assertPluginModelPolicyRequest(t *testing.T, host *handlerDirectExecutorRouteHost, canonicalModel, upstreamModel string) {
+	t.Helper()
+	if host.lastRequest.Model != upstreamModel {
+		t.Fatalf("executor model = %q, want upstream %q", host.lastRequest.Model, upstreamModel)
+	}
+	if got := string(host.lastRequest.Payload); got != `{"model":"glm-5.2","input":"test"}` {
+		t.Fatalf("executor payload = %q, want upstream model", got)
+	}
+	if got := host.lastOptions.Metadata[modelpolicy.CanonicalModelMetadataKey]; got != canonicalModel {
+		t.Fatalf("canonical metadata = %#v, want %q", got, canonicalModel)
+	}
+	if got := host.lastOptions.Metadata[modelpolicy.ContextModeMetadataKey]; got != "1m" {
+		t.Fatalf("context metadata = %#v, want 1m", got)
+	}
+	if got, _ := host.lastOptions.Metadata[modelpolicy.ApprovalHashMetadataKey].(string); got == "" {
+		t.Fatal("approval hash metadata is empty")
 	}
 }
 

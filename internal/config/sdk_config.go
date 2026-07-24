@@ -55,6 +55,32 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+
+	// ModelPolicy defines the public catalog and protocol-aware request admission rules.
+	// An empty policy preserves the upstream default behavior.
+	ModelPolicy ModelPolicyConfig `yaml:"model-policy,omitempty" json:"model-policy,omitempty"`
+}
+
+// ModelPolicyConfig defines a configuration-driven, fail-closed model boundary.
+type ModelPolicyConfig struct {
+	Mode             string                       `yaml:"mode,omitempty" json:"mode,omitempty"`
+	CatalogAllowlist []string                     `yaml:"catalog-allowlist,omitempty" json:"catalog-allowlist,omitempty"`
+	ProtocolRules    map[string][]ModelPolicyRule `yaml:"protocol-rules,omitempty" json:"protocol-rules,omitempty"`
+}
+
+// ModelPolicyRule maps an accepted protocol wire model to its canonical and upstream identities.
+type ModelPolicyRule struct {
+	WireModel             string                    `yaml:"wire-model" json:"wire-model"`
+	Canonical             string                    `yaml:"canonical" json:"canonical"`
+	UpstreamModel         string                    `yaml:"upstream-model,omitempty" json:"upstream-model,omitempty"`
+	RequireContextSignal  *ModelPolicyContextSignal `yaml:"require-context-signal,omitempty" json:"require-context-signal,omitempty"`
+	ExplicitContextSuffix bool                      `yaml:"explicit-context-suffix,omitempty" json:"explicit-context-suffix,omitempty"`
+}
+
+// ModelPolicyContextSignal requires a case-insensitive token in an inbound header.
+type ModelPolicyContextSignal struct {
+	Header   string `yaml:"header" json:"header"`
+	Contains string `yaml:"contains" json:"contains"`
 }
 
 // StreamingConfig holds server streaming behavior configuration.

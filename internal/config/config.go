@@ -319,6 +319,15 @@ type RemoteManagement struct {
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
+	// APICallAllowlist limits the generic management HTTP helper when configured-only model policy is active.
+	APICallAllowlist []ManagementAPICallRule `yaml:"api-call-allowlist,omitempty"`
+}
+
+// ManagementAPICallRule allows one non-inference management HTTP destination.
+type ManagementAPICallRule struct {
+	Host       string   `yaml:"host" json:"host"`
+	PathPrefix string   `yaml:"path-prefix" json:"path-prefix"`
+	Methods    []string `yaml:"methods" json:"methods"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
@@ -770,6 +779,14 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 			return cfgOptional, nil
 		}
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+	if err = ValidateModelPolicy(cfg.ModelPolicy); err != nil {
+		if optional {
+			cfgOptional := &Config{}
+			cfgOptional.NormalizePluginsConfig()
+			return cfgOptional, nil
+		}
+		return nil, fmt.Errorf("invalid model policy: %w", err)
 	}
 
 	// Hash remote management key if plaintext is detected (nested)
@@ -1223,6 +1240,9 @@ func hashSecret(secret string) (string, error) {
 // SaveConfigPreserveComments writes the config back to YAML while preserving existing comments
 // and key ordering by loading the original file into a yaml.Node tree and updating values in-place.
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
 	persistCfg := cfg
 	// Load original YAML as a node tree to preserve comments and ordering.
 	data, err := os.ReadFile(configFile)
@@ -1271,12 +1291,6 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	mergeMappingPreserve(original.Content[0], generated.Content[0])
 	normalizeCollectionNodeStyles(original.Content[0])
 
-	// Write back.
-	f, err := os.Create(configFile)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
@@ -1288,13 +1302,15 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 		return err
 	}
 	data = NormalizeCommentIndentation(buf.Bytes())
-	_, err = f.Write(data)
-	return err
+	return atomicWriteConfigUnlocked(configFile, data)
 }
 
 // SaveConfigPreserveCommentsUpdateNestedScalar updates a nested scalar key path like ["a","b"]
 // while preserving comments and positions.
 func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []string, value string) error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
 	data, err := os.ReadFile(configFile)
 	if err != nil {
 		return err
@@ -1324,11 +1340,6 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 			node = next
 		}
 	}
-	f, err := os.Create(configFile)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
@@ -1340,8 +1351,7 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 		return err
 	}
 	data = NormalizeCommentIndentation(buf.Bytes())
-	_, err = f.Write(data)
-	return err
+	return atomicWriteConfigUnlocked(configFile, data)
 }
 
 // NormalizeCommentIndentation removes indentation from standalone YAML comment lines to keep them left aligned.

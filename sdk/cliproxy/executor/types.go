@@ -110,6 +110,9 @@ type Options struct {
 	ResponseFormat sdktranslator.Format
 	// Metadata carries extra execution hints shared across selection and executors.
 	Metadata map[string]any
+	// ModelPolicyApprovalHash is an internal immutable seal created after auth/provider
+	// selection and checked immediately before the executor is invoked.
+	ModelPolicyApprovalHash string
 	// RequestAfterAuthInterceptor runs after credential selection and before executor translation.
 	RequestAfterAuthInterceptor RequestAfterAuthInterceptor
 }

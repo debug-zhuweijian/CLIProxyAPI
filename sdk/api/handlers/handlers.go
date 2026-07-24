@@ -5,6 +5,7 @@ package handlers
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelpolicy"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -29,6 +31,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"golang.org/x/net/context"
 )
 
@@ -66,6 +69,101 @@ type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
 type disallowFreeAuthContextKey struct{}
+
+func (h *BaseAPIHandler) admitBeforeRouter(ctx context.Context, protocol, modelName string, rawJSON []byte, execOptions modelExecutionOptions) (modelpolicy.Admission, string, []byte, *interfaces.ErrorMessage) {
+	if h == nil || h.Cfg == nil || !modelpolicy.Enabled(h.Cfg.ModelPolicy) {
+		return modelpolicy.Admission{}, modelName, rawJSON, nil
+	}
+	headers := modelExecutionHeaders(ctx, execOptions.Headers)
+	admission, err := modelpolicy.Admit(h.Cfg.ModelPolicy, protocol, modelName, headers)
+	if err != nil {
+		return modelpolicy.Admission{}, "", nil, executionErrorMessage(err)
+	}
+	updated := rawJSON
+	if len(rawJSON) > 0 {
+		updated, err = sjson.SetBytes(rawJSON, "model", admission.Canonical)
+		if err != nil {
+			return modelpolicy.Admission{}, "", nil, &interfaces.ErrorMessage{
+				StatusCode: http.StatusBadRequest,
+				Error:      fmt.Errorf("rewrite admitted model: %w", err),
+			}
+		}
+	}
+	return admission, admission.Canonical, updated, nil
+}
+
+func addModelPolicyMetadata(metadata map[string]any, admission modelpolicy.Admission) {
+	if metadata == nil || admission.Canonical == "" {
+		return
+	}
+	metadata[modelpolicy.CanonicalModelMetadataKey] = admission.Canonical
+	metadata[modelpolicy.ContextModeMetadataKey] = admission.ContextMode
+}
+
+func (h *BaseAPIHandler) pluginExecutionApproval(protocol, pluginID string, req coreexecutor.Request, opts *coreexecutor.Options) (modelpolicy.Approval, bool, error) {
+	if h == nil || h.Cfg == nil || !modelpolicy.Enabled(h.Cfg.ModelPolicy) {
+		return modelpolicy.Approval{}, false, nil
+	}
+	if opts == nil || opts.Metadata == nil {
+		return modelpolicy.Approval{}, true, &modelpolicy.Error{Protocol: protocol, Model: req.Model, Reason: "canonical identity is missing"}
+	}
+	canonical, _ := opts.Metadata[modelpolicy.CanonicalModelMetadataKey].(string)
+	if err := modelpolicy.ValidateFinal(h.Cfg.ModelPolicy, protocol, canonical, req.Model); err != nil {
+		return modelpolicy.Approval{}, true, err
+	}
+	payloadModel, err := modelpolicy.ValidatePayloadModel(protocol, canonical, req.Model, req.Payload)
+	if err != nil {
+		return modelpolicy.Approval{}, true, err
+	}
+	pluginID = strings.ToLower(strings.TrimSpace(pluginID))
+	identity := sha256.Sum256([]byte("plugin:" + pluginID + ":no-core-auth"))
+	approval := modelpolicy.Approval{
+		Protocol:         modelpolicy.NormalizeProtocol(protocol),
+		Provider:         "plugin",
+		AuthIdentityKind: "plugin",
+		AuthIdentityHash: fmt.Sprintf("%x", identity[:]),
+		ExecutorKind:     "plugin:" + pluginID,
+		Canonical:        canonical,
+		UpstreamModel:    req.Model,
+		ContextMode:      stringMetadata(opts.Metadata, modelpolicy.ContextModeMetadataKey),
+		PayloadModel:     payloadModel,
+	}
+	return approval, true, nil
+}
+
+func (h *BaseAPIHandler) sealPluginExecution(protocol, pluginID string, req coreexecutor.Request, opts *coreexecutor.Options) error {
+	approval, enabled, err := h.pluginExecutionApproval(protocol, pluginID, req, opts)
+	if err != nil || !enabled {
+		return err
+	}
+	opts.ModelPolicyApprovalHash = approval.Hash()
+	return nil
+}
+
+func (h *BaseAPIHandler) admitPluginExecution(protocol, pluginID string, req coreexecutor.Request, opts *coreexecutor.Options) error {
+	approval, enabled, err := h.pluginExecutionApproval(protocol, pluginID, req, opts)
+	if err != nil || !enabled {
+		return err
+	}
+	expected := strings.TrimSpace(opts.ModelPolicyApprovalHash)
+	if expected == "" {
+		return &modelpolicy.Error{Protocol: protocol, Model: req.Model, Reason: "approved execution tuple is missing"}
+	}
+	actual := approval.Hash()
+	if actual != expected {
+		return &modelpolicy.Error{Protocol: protocol, Model: req.Model, Reason: "approved execution tuple changed after plugin route selection"}
+	}
+	opts.Metadata[modelpolicy.ApprovalHashMetadataKey] = actual
+	return nil
+}
+
+func stringMetadata(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, _ := metadata[key].(string)
+	return strings.TrimSpace(value)
+}
 
 // PluginInterceptorHost applies plugin interceptors around handler execution.
 type PluginInterceptorHost interface {
@@ -741,13 +839,18 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 
 func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
+	admission, admittedModel, admittedJSON, admissionErr := h.admitBeforeRouter(ctx, entryProtocol, modelName, rawJSON, execOptions)
+	if admissionErr != nil {
+		return nil, nil, admissionErr
+	}
+	modelName, rawJSON = admittedModel, admittedJSON
 	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, false, execOptions)
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
 	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
 		return nil, nil, errMsg
 	}
 	if routeDecision.ExecutorPluginID != "" {
-		return h.executeWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
+		return h.executeWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions, admission)
 	}
 	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
 	if errMsg != nil {
@@ -756,6 +859,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addModelPolicyMetadata(reqMeta, admission)
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
@@ -814,9 +918,14 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 
 func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
+	admission, admittedModel, admittedJSON, admissionErr := h.admitBeforeRouter(ctx, handlerType, modelName, rawJSON, execOptions)
+	if admissionErr != nil {
+		return nil, nil, admissionErr
+	}
+	modelName, rawJSON = admittedModel, admittedJSON
 	routeDecision := h.applyModelRouter(ctx, handlerType, modelName, rawJSON, false, execOptions)
 	if routeDecision.ExecutorPluginID != "" {
-		return h.countWithPluginExecutor(ctx, handlerType, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
+		return h.countWithPluginExecutor(ctx, handlerType, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions, admission)
 	}
 	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, false, routeDecision, execOptions)
 	if errMsg != nil {
@@ -825,6 +934,7 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	providers = adjustExecutionProvidersForEntryProtocol(handlerType, providers)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addModelPolicyMetadata(reqMeta, admission)
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
@@ -873,14 +983,20 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	return body, responseHeaders, nil
 }
 
-func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions, admission modelpolicy.Admission) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	host := h.pluginExecutorHost()
 	if host == nil {
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor host is unavailable")}
 	}
-	req, opts := h.pluginExecutorRequest(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, false, execOptions)
+	req, opts := h.pluginExecutorRequest(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, false, execOptions, admission)
 	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	if errAdmission := h.sealPluginExecution(entryProtocol, executorPluginID, req, &opts); errAdmission != nil {
+		return nil, nil, executionErrorMessage(errAdmission)
+	}
 	req, opts = h.applyRequestInterceptorsAfterPluginExecutorRoute(ctx, host, executorPluginID, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	if errAdmission := h.admitPluginExecution(entryProtocol, executorPluginID, req, &opts); errAdmission != nil {
+		return nil, nil, executionErrorMessage(errAdmission)
+	}
 	resp, errExecute := host.ExecutePluginExecutor(ctx, executorPluginID, req, opts)
 	if errExecute != nil {
 		return nil, nil, executionErrorMessage(errExecute)
@@ -891,14 +1007,20 @@ func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryPro
 	return body, responseHeaders, nil
 }
 
-func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerType, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerType, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions, admission modelpolicy.Admission) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	host := h.pluginExecutorHost()
 	if host == nil {
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor host is unavailable")}
 	}
-	req, opts := h.pluginExecutorRequest(ctx, handlerType, handlerType, modelName, originalRequestedModel, rawJSON, alt, false, execOptions)
+	req, opts := h.pluginExecutorRequest(ctx, handlerType, handlerType, modelName, originalRequestedModel, rawJSON, alt, false, execOptions, admission)
 	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, handlerType, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	if errAdmission := h.sealPluginExecution(handlerType, executorPluginID, req, &opts); errAdmission != nil {
+		return nil, nil, executionErrorMessage(errAdmission)
+	}
 	req, opts = h.applyRequestInterceptorsAfterPluginExecutorRoute(ctx, host, executorPluginID, handlerType, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	if errAdmission := h.admitPluginExecution(handlerType, executorPluginID, req, &opts); errAdmission != nil {
+		return nil, nil, executionErrorMessage(errAdmission)
+	}
 	resp, errCount := host.CountPluginExecutor(ctx, executorPluginID, req, opts)
 	if errCount != nil {
 		return nil, nil, executionErrorMessage(errCount)
@@ -909,19 +1031,27 @@ func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerTyp
 	return body, responseHeaders, nil
 }
 
-func (h *BaseAPIHandler) pluginExecutorRequest(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt string, stream bool, execOptions modelExecutionOptions) (coreexecutor.Request, coreexecutor.Options) {
+func (h *BaseAPIHandler) pluginExecutorRequest(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt string, stream bool, execOptions modelExecutionOptions, admission modelpolicy.Admission) (coreexecutor.Request, coreexecutor.Options) {
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addModelPolicyMetadata(reqMeta, admission)
+	executionModel := modelName
+	payload := rawJSON
+	if admission.UpstreamModel != "" {
+		executionModel = admission.UpstreamModel
+		if len(payload) > 0 {
+			payload, _ = sjson.SetBytes(payload, "model", executionModel)
+		}
+	}
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
-	setReasoningEffortMetadata(reqMeta, entryProtocol, modelName, rawJSON)
-	setServiceTierMetadata(reqMeta, rawJSON)
-	setGenerateMetadata(reqMeta, rawJSON)
-	payload := rawJSON
+	setReasoningEffortMetadata(reqMeta, entryProtocol, executionModel, payload)
+	setServiceTierMetadata(reqMeta, payload)
+	setGenerateMetadata(reqMeta, payload)
 	if len(payload) == 0 {
 		payload = nil
 	}
-	req := coreexecutor.Request{Model: modelName, Payload: payload}
+	req := coreexecutor.Request{Model: executionModel, Payload: payload}
 	opts := coreexecutor.Options{
 		Stream:          stream,
 		Alt:             alt,
@@ -991,7 +1121,7 @@ func (h *BaseAPIHandler) ExecuteImageStreamWithAuthManager(ctx context.Context, 
 	return h.executeStreamWithAuthManager(ctx, handlerType, modelName, rawJSON, alt, true)
 }
 
-func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions, admission modelpolicy.Admission) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	host := h.pluginExecutorHost()
 	if host == nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -999,9 +1129,21 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		close(errChan)
 		return nil, nil, errChan
 	}
-	req, opts := h.pluginExecutorRequest(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, true, execOptions)
+	req, opts := h.pluginExecutorRequest(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, true, execOptions, admission)
 	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	if errAdmission := h.sealPluginExecution(entryProtocol, executorPluginID, req, &opts); errAdmission != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- executionErrorMessage(errAdmission)
+		close(errChan)
+		return nil, nil, errChan
+	}
 	req, opts = h.applyRequestInterceptorsAfterPluginExecutorRoute(ctx, host, executorPluginID, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	if errAdmission := h.admitPluginExecution(entryProtocol, executorPluginID, req, &opts); errAdmission != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- executionErrorMessage(errAdmission)
+		close(errChan)
+		return nil, nil, errChan
+	}
 	streamResult, errStream := host.ExecutePluginExecutorStream(ctx, executorPluginID, req, opts)
 	if errStream != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -1139,6 +1281,14 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 
 func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
+	admission, admittedModel, admittedJSON, admissionErr := h.admitBeforeRouter(ctx, entryProtocol, modelName, rawJSON, execOptions)
+	if admissionErr != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- admissionErr
+		close(errChan)
+		return nil, nil, errChan
+	}
+	modelName, rawJSON = admittedModel, admittedJSON
 	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
 	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
@@ -1148,7 +1298,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		return nil, nil, errChan
 	}
 	if routeDecision.ExecutorPluginID != "" {
-		return h.streamWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
+		return h.streamWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions, admission)
 	}
 	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
 	if errMsg != nil {
@@ -1160,6 +1310,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addModelPolicyMetadata(reqMeta, admission)
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
