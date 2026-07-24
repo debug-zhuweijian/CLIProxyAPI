@@ -13,7 +13,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
-const functionalConfigProjectionSchemaVersion = 1
+const (
+	functionalConfigProjectionSchemaVersion       = 1
+	functionalConfigAPICallAllowlistProjectionKey = "remote-management-api-call-allowlist"
+)
 
 var functionalConfigProjectionKeys = stringSet(
 	"antigravity-signature-bypass-strict",
@@ -44,6 +47,7 @@ var functionalConfigProjectionKeys = stringSet(
 	"redis-usage-queue-retention-seconds",
 	"request-log",
 	"request-retry",
+	functionalConfigAPICallAllowlistProjectionKey,
 	"routing",
 	"save-cooldown-status",
 	"streaming",
@@ -251,6 +255,37 @@ func classifyFunctionalConfig(full map[string]json.RawMessage) functionalConfigP
 	}
 }
 
+func buildFunctionalConfigProjection(cfg *config.Config) (functionalConfigProjectionEnvelope, error) {
+	full, err := configJSONMap(cfg)
+	if err != nil {
+		return functionalConfigProjectionEnvelope{}, err
+	}
+	projection := classifyFunctionalConfig(full)
+	rules := cfg.RemoteManagement.APICallAllowlist
+	if rules == nil {
+		rules = []config.ManagementAPICallRule{}
+	}
+	allowlistJSON, err := json.Marshal(rules)
+	if err != nil {
+		return functionalConfigProjectionEnvelope{}, fmt.Errorf("marshal management api-call allowlist: %w", err)
+	}
+	projection.Config[functionalConfigAPICallAllowlistProjectionKey] = allowlistJSON
+	return projection, nil
+}
+
+func decodeFunctionalAPICallAllowlist(raw json.RawMessage) ([]config.ManagementAPICallRule, error) {
+	var rules []config.ManagementAPICallRule
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&rules); err != nil {
+		return nil, fmt.Errorf("decode management api-call allowlist: %w", err)
+	}
+	if rules == nil {
+		rules = []config.ManagementAPICallRule{}
+	}
+	return rules, nil
+}
+
 // GetFunctionalConfig returns the non-secret, environment-independent config
 // projection used by local/VPS consistency tooling.
 func (h *Handler) GetFunctionalConfig(c *gin.Context) {
@@ -258,12 +293,12 @@ func (h *Handler) GetFunctionalConfig(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config_unavailable"})
 		return
 	}
-	full, err := configJSONMap(canonicalizeFunctionalConfig(h.cfg))
+	projection, err := buildFunctionalConfigProjection(canonicalizeFunctionalConfig(h.cfg))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "projection_failed", "message": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, classifyFunctionalConfig(full))
+	c.JSON(http.StatusOK, projection)
 }
 
 // PutFunctionalConfig atomically replaces only the functional projection.
@@ -319,10 +354,30 @@ func (h *Handler) PutFunctionalConfig(c *gin.Context) {
 		return
 	}
 
-	merged, err := cloneConfigWithJSONProjection(h.cfg, functionalConfigProjectionKeys, request.Config)
+	resetKeys := make(map[string]struct{}, len(functionalConfigProjectionKeys)-1)
+	updates := make(map[string]json.RawMessage, len(request.Config))
+	for key := range functionalConfigProjectionKeys {
+		if key != functionalConfigAPICallAllowlistProjectionKey {
+			resetKeys[key] = struct{}{}
+		}
+	}
+	for key, value := range request.Config {
+		if key != functionalConfigAPICallAllowlistProjectionKey {
+			updates[key] = value
+		}
+	}
+	merged, err := cloneConfigWithJSONProjection(h.cfg, resetKeys, updates)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_projection", "message": err.Error()})
 		return
+	}
+	if allowlistJSON, ok := request.Config[functionalConfigAPICallAllowlistProjectionKey]; ok {
+		allowlist, errDecode := decodeFunctionalAPICallAllowlist(allowlistJSON)
+		if errDecode != nil {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_projection", "message": errDecode.Error()})
+			return
+		}
+		merged.RemoteManagement.APICallAllowlist = allowlist
 	}
 	if err = config.ValidateModelPolicy(merged.ModelPolicy); err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_model_policy", "message": err.Error()})

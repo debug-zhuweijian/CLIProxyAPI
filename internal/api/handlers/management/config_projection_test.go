@@ -48,11 +48,10 @@ func decodeProjectionResponse(t *testing.T, recorder *httptest.ResponseRecorder)
 
 func projectionJSON(t *testing.T, cfg *config.Config) []byte {
 	t.Helper()
-	full, err := configJSONMap(canonicalizeFunctionalConfig(cfg))
+	envelope, err := buildFunctionalConfigProjection(canonicalizeFunctionalConfig(cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
-	envelope := classifyFunctionalConfig(full)
 	data, err := json.Marshal(envelope)
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +70,16 @@ func TestGetFunctionalConfigExcludesSecretsAndEnvironment(t *testing.T) {
 		TLS:       config.TLSConfig{Enable: true, Cert: "cert.pem", Key: "key.pem"},
 		Plugins:   config.PluginsConfig{Enabled: true, Dir: "plugins"},
 		ClaudeKey: []config.ClaudeKey{{APIKey: "secret-provider-key"}},
-		Debug:     true,
+		RemoteManagement: config.RemoteManagement{
+			AllowRemote: true,
+			SecretKey:   "secret-management-key",
+			APICallAllowlist: []config.ManagementAPICallRule{{
+				Host:       "chatgpt.com",
+				PathPrefix: "/backend-api/wham/usage",
+				Methods:    []string{http.MethodGet},
+			}},
+		},
+		Debug: true,
 	}}
 
 	recorder := httptest.NewRecorder()
@@ -92,6 +100,20 @@ func TestGetFunctionalConfigExcludesSecretsAndEnvironment(t *testing.T) {
 	if _, ok := response.Config["model-policy"]; !ok {
 		t.Fatal("functional model-policy key missing")
 	}
+	allowlistJSON, ok := response.Config["remote-management-api-call-allowlist"]
+	if !ok {
+		t.Fatal("functional management api-call allowlist key missing")
+	}
+	var allowlist []config.ManagementAPICallRule
+	if err := json.Unmarshal(allowlistJSON, &allowlist); err != nil {
+		t.Fatalf("decode management api-call allowlist: %v", err)
+	}
+	if len(allowlist) != 1 ||
+		allowlist[0].Host != "chatgpt.com" ||
+		allowlist[0].PathPrefix != "/backend-api/wham/usage" ||
+		!reflect.DeepEqual(allowlist[0].Methods, []string{http.MethodGet}) {
+		t.Fatalf("unexpected management api-call allowlist: %#v", allowlist)
+	}
 	for _, forbidden := range []string{"api-keys", "claude-api-key", "plugins", "proxy-url", "tls"} {
 		if _, ok := response.Config[forbidden]; ok {
 			t.Fatalf("forbidden key %q leaked into projection", forbidden)
@@ -99,6 +121,7 @@ func TestGetFunctionalConfigExcludesSecretsAndEnvironment(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), "secret-client-key") ||
 		strings.Contains(recorder.Body.String(), "secret-provider-key") ||
+		strings.Contains(recorder.Body.String(), "secret-management-key") ||
 		strings.Contains(recorder.Body.String(), "proxy.invalid") {
 		t.Fatal("projection leaked a secret or environment-local value")
 	}
@@ -225,6 +248,11 @@ func TestPutFunctionalConfigPreservesTargetSecretsAndEnvironment(t *testing.T) {
 				SecretKey:             "target-management-secret",
 				DisableControlPanel:   true,
 				PanelGitHubRepository: "https://target-panel.invalid/repository",
+				APICallAllowlist: []config.ManagementAPICallRule{{
+					Host:       "target.invalid",
+					PathPrefix: "/legacy",
+					Methods:    []string{http.MethodPost},
+				}},
 			},
 		},
 		configFilePath: path,
@@ -246,12 +274,24 @@ func TestPutFunctionalConfigPreservesTargetSecretsAndEnvironment(t *testing.T) {
 				Params: map[string]any{"reasoning.effort": "max"},
 			}},
 		},
+		RemoteManagement: config.RemoteManagement{
+			APICallAllowlist: []config.ManagementAPICallRule{{
+				Host:       "chatgpt.com",
+				PathPrefix: "/backend-api/wham/usage",
+				Methods:    []string{http.MethodGet},
+			}},
+		},
 	}
 	full, err := configJSONMap(canonicalizeFunctionalConfig(source))
 	if err != nil {
 		t.Fatal(err)
 	}
 	envelope := classifyFunctionalConfig(full)
+	allowlistJSON, err := json.Marshal(source.RemoteManagement.APICallAllowlist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope.Config["remote-management-api-call-allowlist"] = allowlistJSON
 	body, err := json.Marshal(envelope)
 	if err != nil {
 		t.Fatal(err)
@@ -294,6 +334,13 @@ func TestPutFunctionalConfigPreservesTargetSecretsAndEnvironment(t *testing.T) {
 		h.cfg.Home.NodeID != "target-home-node" ||
 		h.cfg.Home.Port != 6380 {
 		t.Fatal("target server, management, auth directory, or runtime Home config was changed")
+	}
+	if !reflect.DeepEqual(h.cfg.RemoteManagement.APICallAllowlist, source.RemoteManagement.APICallAllowlist) {
+		t.Fatalf(
+			"management api-call allowlist not applied:\nwant: %#v\ngot:  %#v",
+			source.RemoteManagement.APICallAllowlist,
+			h.cfg.RemoteManagement.APICallAllowlist,
+		)
 	}
 	written, err := os.ReadFile(path)
 	if err != nil {
@@ -338,5 +385,149 @@ func TestPutFunctionalConfigRejectsUnknownKey(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), "future-unknown") {
 		t.Fatalf("response does not identify unknown key: %s", recorder.Body.String())
+	}
+}
+
+func TestPutFunctionalConfigRejectsEmptyConfigWithoutPanic(t *testing.T) {
+	t.Parallel()
+	h := &Handler{
+		cfg:            &config.Config{SDKConfig: config.SDKConfig{ModelPolicy: testConfiguredModelPolicy()}},
+		configFilePath: writeTestConfigFile(t),
+	}
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/v0/management/config/functional",
+		strings.NewReader(`{"schema-version":1,"config":{}}`),
+	)
+	context.Request.Header.Set("Content-Type", "application/json")
+	h.PutFunctionalConfig(context)
+
+	if recorder.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want %d, body = %s", recorder.Code, http.StatusUnprocessableEntity, recorder.Body.String())
+	}
+}
+
+func TestPutFunctionalConfigClearsAPICallAllowlistWithEmptyList(t *testing.T) {
+	t.Parallel()
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: config.SDKConfig{ModelPolicy: testConfiguredModelPolicy()},
+			RemoteManagement: config.RemoteManagement{
+				APICallAllowlist: []config.ManagementAPICallRule{{
+					Host:       "target.invalid",
+					PathPrefix: "/legacy",
+					Methods:    []string{http.MethodPost},
+				}},
+			},
+		},
+		configFilePath: writeTestConfigFile(t),
+	}
+	source := &config.Config{
+		SDKConfig: config.SDKConfig{ModelPolicy: testConfiguredModelPolicy()},
+		RemoteManagement: config.RemoteManagement{
+			APICallAllowlist: []config.ManagementAPICallRule{},
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/v0/management/config/functional",
+		bytes.NewReader(projectionJSON(t, source)),
+	)
+	context.Request.Header.Set("Content-Type", "application/json")
+	h.PutFunctionalConfig(context)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if len(h.cfg.RemoteManagement.APICallAllowlist) != 0 {
+		t.Fatalf("management api-call allowlist was not cleared: %#v", h.cfg.RemoteManagement.APICallAllowlist)
+	}
+}
+
+func TestPutFunctionalConfigWithoutAPICallAllowlistPreservesTarget(t *testing.T) {
+	t.Parallel()
+	targetAllowlist := []config.ManagementAPICallRule{{
+		Host:       "target.invalid",
+		PathPrefix: "/legacy",
+		Methods:    []string{http.MethodPost},
+	}}
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig:        config.SDKConfig{ModelPolicy: testConfiguredModelPolicy()},
+			RemoteManagement: config.RemoteManagement{APICallAllowlist: targetAllowlist},
+		},
+		configFilePath: writeTestConfigFile(t),
+	}
+	source := &config.Config{SDKConfig: config.SDKConfig{ModelPolicy: testConfiguredModelPolicy()}}
+	full, err := configJSONMap(canonicalizeFunctionalConfig(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(classifyFunctionalConfig(full))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/v0/management/config/functional",
+		bytes.NewReader(body),
+	)
+	context.Request.Header.Set("Content-Type", "application/json")
+	h.PutFunctionalConfig(context)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !reflect.DeepEqual(h.cfg.RemoteManagement.APICallAllowlist, targetAllowlist) {
+		t.Fatalf(
+			"legacy projection changed target management api-call allowlist:\nwant: %#v\ngot:  %#v",
+			targetAllowlist,
+			h.cfg.RemoteManagement.APICallAllowlist,
+		)
+	}
+}
+
+func TestPutFunctionalConfigRejectsUnknownAPICallAllowlistField(t *testing.T) {
+	t.Parallel()
+	h := &Handler{
+		cfg:            &config.Config{SDKConfig: config.SDKConfig{ModelPolicy: testConfiguredModelPolicy()}},
+		configFilePath: writeTestConfigFile(t),
+	}
+	source := &config.Config{SDKConfig: config.SDKConfig{ModelPolicy: testConfiguredModelPolicy()}}
+	projection, err := buildFunctionalConfigProjection(canonicalizeFunctionalConfig(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection.Config[functionalConfigAPICallAllowlistProjectionKey] = json.RawMessage(
+		`[{"host":"chatgpt.com","path-prefix":"/backend-api/wham/usage","methods":["GET"],"secret-key":"must-not-be-accepted"}]`,
+	)
+	body, err := json.Marshal(projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/v0/management/config/functional",
+		bytes.NewReader(body),
+	)
+	context.Request.Header.Set("Content-Type", "application/json")
+	h.PutFunctionalConfig(context)
+
+	if recorder.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want %d, body = %s", recorder.Code, http.StatusUnprocessableEntity, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "unknown field") {
+		t.Fatalf("response does not identify unknown nested field: %s", recorder.Body.String())
 	}
 }
