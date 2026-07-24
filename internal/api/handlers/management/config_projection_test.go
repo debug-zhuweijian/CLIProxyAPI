@@ -94,14 +94,30 @@ func TestPutFunctionalConfigPreservesTargetSecretsAndEnvironment(t *testing.T) {
 	h := &Handler{
 		cfg: &config.Config{
 			SDKConfig: config.SDKConfig{
-				ProxyURL:    "http://target-proxy.invalid",
-				APIKeys:     []string{"target-client-key"},
-				ModelPolicy: testConfiguredModelPolicy(),
+				ProxyURL:           "http://target-proxy.invalid",
+				APIKeys:            []string{"target-client-key"},
+				ModelPolicy:        testConfiguredModelPolicy(),
+				GPTImage2BaseModel: "gpt-target-model",
 			},
+			Host:      "127.0.0.1",
+			Port:      8317,
+			AuthDir:   "target-auths",
 			TLS:       config.TLSConfig{Enable: true, Cert: "target-cert.pem", Key: "target-key.pem"},
 			Plugins:   config.PluginsConfig{Enabled: true, Dir: "target-plugins"},
 			ClaudeKey: []config.ClaudeKey{{APIKey: "target-provider-key"}},
 			Debug:     false,
+			Home: config.HomeConfig{
+				Enabled: true,
+				NodeID:  "target-home-node",
+				Host:    "target-home.invalid",
+				Port:    6380,
+			},
+			RemoteManagement: config.RemoteManagement{
+				AllowRemote:           true,
+				SecretKey:             "target-management-secret",
+				DisableControlPanel:   true,
+				PanelGitHubRepository: "https://target-panel.invalid/repository",
+			},
 		},
 		configFilePath: path,
 	}
@@ -133,6 +149,9 @@ func TestPutFunctionalConfigPreservesTargetSecretsAndEnvironment(t *testing.T) {
 	if !h.cfg.Debug || h.cfg.RequestRetry != 7 {
 		t.Fatalf("functional values not applied: debug=%v request-retry=%d", h.cfg.Debug, h.cfg.RequestRetry)
 	}
+	if h.cfg.GPTImage2BaseModel != "" {
+		t.Fatalf("omitted functional field was not reset: gpt-image-2-base-model=%q", h.cfg.GPTImage2BaseModel)
+	}
 	if h.cfg.ProxyURL != "http://target-proxy.invalid" ||
 		len(h.cfg.APIKeys) != 1 || h.cfg.APIKeys[0] != "target-client-key" ||
 		len(h.cfg.ClaudeKey) != 1 || h.cfg.ClaudeKey[0].APIKey != "target-provider-key" ||
@@ -140,11 +159,28 @@ func TestPutFunctionalConfigPreservesTargetSecretsAndEnvironment(t *testing.T) {
 		h.cfg.TLS.Cert != "target-cert.pem" {
 		t.Fatal("target secret or environment-local config was changed")
 	}
+	if h.cfg.Host != "127.0.0.1" ||
+		h.cfg.Port != 8317 ||
+		h.cfg.AuthDir != "target-auths" ||
+		!h.cfg.RemoteManagement.AllowRemote ||
+		h.cfg.RemoteManagement.SecretKey != "target-management-secret" ||
+		h.cfg.RemoteManagement.PanelGitHubRepository != "https://target-panel.invalid/repository" ||
+		h.cfg.Home.NodeID != "target-home-node" ||
+		h.cfg.Home.Port != 6380 {
+		t.Fatal("target server, management, auth directory, or runtime Home config was changed")
+	}
 	written, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, preserved := range []string{"target-client-key", "target-provider-key", "target-proxy.invalid", "target-plugins"} {
+	for _, preserved := range []string{
+		"port: 8317",
+		"target-management-secret",
+		"target-client-key",
+		"target-provider-key",
+		"target-proxy.invalid",
+		"target-plugins",
+	} {
 		if !strings.Contains(string(written), preserved) {
 			t.Fatalf("persisted config did not preserve %q", preserved)
 		}

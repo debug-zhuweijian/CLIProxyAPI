@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 func TestGetStaticAuthSummaryReturnsCountsWithoutSecrets(t *testing.T) {
@@ -38,17 +39,40 @@ func TestGetStaticAuthSummaryReturnsCountsWithoutSecrets(t *testing.T) {
 
 func TestPutStaticAuthConfigPreservesFunctionalAndEnvironmentConfig(t *testing.T) {
 	t.Parallel()
+	var targetPlugins config.PluginsConfig
+	if err := yaml.Unmarshal([]byte(`
+enabled: true
+dir: target-plugins
+configs:
+  sample:
+    enabled: true
+    custom-setting: preserve-me
+`), &targetPlugins); err != nil {
+		t.Fatal(err)
+	}
 	target := &config.Config{
 		SDKConfig: config.SDKConfig{
 			ProxyURL:    "http://target-proxy.invalid",
 			APIKeys:     []string{"old-client"},
 			ModelPolicy: testConfiguredModelPolicy(),
 		},
-		Debug: true,
-		Plugins: config.PluginsConfig{
+		Host:    "127.0.0.1",
+		Port:    8317,
+		AuthDir: "target-auths",
+		Debug:   true,
+		Home: config.HomeConfig{
 			Enabled: true,
-			Dir:     "target-plugins",
+			NodeID:  "target-home-node",
+			Host:    "target-home.invalid",
+			Port:    6380,
 		},
+		RemoteManagement: config.RemoteManagement{
+			AllowRemote:           true,
+			SecretKey:             "target-management-secret",
+			DisableControlPanel:   true,
+			PanelGitHubRepository: "https://target-panel.invalid/repository",
+		},
+		Plugins:   targetPlugins,
 		ClaudeKey: []config.ClaudeKey{{APIKey: "old-provider"}},
 	}
 	source := &config.Config{
@@ -81,6 +105,22 @@ func TestPutStaticAuthConfigPreservesFunctionalAndEnvironmentConfig(t *testing.T
 		h.cfg.Plugins.Dir != "target-plugins" ||
 		h.cfg.ModelPolicy.Mode != "configured-only" {
 		t.Fatal("functional or environment-local config changed")
+	}
+	if h.cfg.Host != "127.0.0.1" ||
+		h.cfg.Port != 8317 ||
+		h.cfg.AuthDir != "target-auths" ||
+		!h.cfg.RemoteManagement.AllowRemote ||
+		h.cfg.RemoteManagement.SecretKey != "target-management-secret" ||
+		h.cfg.Home.NodeID != "target-home-node" ||
+		h.cfg.Home.Port != 6380 {
+		t.Fatal("target server, management, auth directory, or runtime Home config changed")
+	}
+	pluginYAML, err := yaml.Marshal(h.cfg.Plugins.Configs["sample"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(pluginYAML), "custom-setting: preserve-me") {
+		t.Fatalf("plugin custom config was lost: %s", string(pluginYAML))
 	}
 }
 

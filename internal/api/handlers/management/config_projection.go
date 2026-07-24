@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"sort"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -106,6 +108,66 @@ func configJSONMap(cfg *config.Config) (map[string]json.RawMessage, error) {
 	return result, nil
 }
 
+func cloneConfigWithJSONProjection(
+	cfg *config.Config,
+	resetKeys map[string]struct{},
+	updates map[string]json.RawMessage,
+) (*config.Config, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("config is nil")
+	}
+	merged := cfg.CloneForRuntime()
+	resetJSONTaggedFields(reflect.ValueOf(merged).Elem(), resetKeys)
+
+	data, err := json.Marshal(updates)
+	if err != nil {
+		return nil, fmt.Errorf("marshal projection: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(merged); err != nil {
+		return nil, fmt.Errorf("decode projection: %w", err)
+	}
+	return merged, nil
+}
+
+func resetJSONTaggedFields(value reflect.Value, resetKeys map[string]struct{}) {
+	if !value.IsValid() {
+		return
+	}
+	if value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return
+		}
+		resetJSONTaggedFields(value.Elem(), resetKeys)
+		return
+	}
+	if value.Kind() != reflect.Struct {
+		return
+	}
+
+	valueType := value.Type()
+	for index := 0; index < value.NumField(); index++ {
+		fieldType := valueType.Field(index)
+		fieldValue := value.Field(index)
+		tag := fieldType.Tag.Get("json")
+		name := strings.Split(tag, ",")[0]
+		if fieldType.Anonymous && name == "" {
+			resetJSONTaggedFields(fieldValue, resetKeys)
+			continue
+		}
+		if name == "" {
+			name = fieldType.Name
+		}
+		if name == "-" {
+			continue
+		}
+		if _, ok := resetKeys[name]; ok && fieldValue.CanSet() {
+			fieldValue.SetZero()
+		}
+	}
+}
+
 func classifyFunctionalConfig(full map[string]json.RawMessage) functionalConfigProjectionEnvelope {
 	projection := make(map[string]json.RawMessage)
 	unclassified := make([]string, 0)
@@ -200,22 +262,8 @@ func (h *Handler) PutFunctionalConfig(c *gin.Context) {
 		return
 	}
 
-	for key := range functionalConfigProjectionKeys {
-		delete(current, key)
-	}
-	for key, value := range request.Config {
-		current[key] = append(json.RawMessage(nil), value...)
-	}
-
-	mergedJSON, err := json.Marshal(current)
+	merged, err := cloneConfigWithJSONProjection(h.cfg, functionalConfigProjectionKeys, request.Config)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "projection_failed", "message": err.Error()})
-		return
-	}
-	var merged config.Config
-	mergedDecoder := json.NewDecoder(bytes.NewReader(mergedJSON))
-	mergedDecoder.DisallowUnknownFields()
-	if err = mergedDecoder.Decode(&merged); err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_projection", "message": err.Error()})
 		return
 	}
@@ -225,7 +273,7 @@ func (h *Handler) PutFunctionalConfig(c *gin.Context) {
 	}
 
 	previous := h.cfg
-	h.cfg = &merged
+	h.cfg = merged
 	if !h.persistLocked(c) {
 		h.cfg = previous
 	}

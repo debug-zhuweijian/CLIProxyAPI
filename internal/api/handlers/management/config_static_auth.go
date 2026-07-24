@@ -1,7 +1,6 @@
 package management
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -146,49 +145,28 @@ func (h *Handler) PutStaticAuthConfig(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	current, err := configJSONMap(h.cfg)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "projection_failed", "message": err.Error()})
-		return
-	}
+
+	topLevelUpdates := make(map[string]json.RawMessage, len(request.Config)-1)
+	topLevelResetKeys := make(map[string]struct{}, len(request.Config)-1)
 	for key, raw := range request.Config {
 		if key == "plugin-store-auth" {
 			continue
 		}
-		current[key] = append(json.RawMessage(nil), raw...)
+		topLevelUpdates[key] = append(json.RawMessage(nil), raw...)
+		topLevelResetKeys[key] = struct{}{}
 	}
-	var plugins map[string]json.RawMessage
-	if raw := current["plugins"]; len(raw) > 0 {
-		if err = json.Unmarshal(raw, &plugins); err != nil {
-			c.JSON(http.StatusConflict, gin.H{"error": "invalid_target_plugins", "message": err.Error()})
-			return
-		}
-	}
-	if plugins == nil {
-		plugins = make(map[string]json.RawMessage)
-	}
-	plugins["store-auth"] = append(json.RawMessage(nil), request.Config["plugin-store-auth"]...)
-	current["plugins"], err = json.Marshal(plugins)
+	merged, err := cloneConfigWithJSONProjection(h.cfg, topLevelResetKeys, topLevelUpdates)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "projection_failed", "message": err.Error()})
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_projection", "message": err.Error()})
 		return
 	}
-
-	mergedJSON, err := json.Marshal(current)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "projection_failed", "message": err.Error()})
-		return
-	}
-	var merged config.Config
-	mergedDecoder := json.NewDecoder(bytes.NewReader(mergedJSON))
-	mergedDecoder.DisallowUnknownFields()
-	if err = mergedDecoder.Decode(&merged); err != nil {
+	if err = json.Unmarshal(request.Config["plugin-store-auth"], &merged.Plugins.StoreAuth); err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_projection", "message": err.Error()})
 		return
 	}
 
 	previous := h.cfg
-	h.cfg = &merged
+	h.cfg = merged
 	if !h.persistLocked(c) {
 		h.cfg = previous
 	}
