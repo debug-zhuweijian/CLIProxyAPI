@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	claudemodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/claude/models"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 )
 
 func TestNormalizeModelID(t *testing.T) {
@@ -77,7 +77,7 @@ func TestAdmitProtocolRules(t *testing.T) {
 
 func TestAdmitStrictClaudeFableRoundTrip(t *testing.T) {
 	policy := dualModelPolicy()
-	wire := util.EnsureClaudeModelIDPrefix("glm-5.2[1m]")
+	wire := claudemodels.EnsureClaudeModelIDPrefix("glm-5.2[1m]")
 	got, err := Admit(policy, "anthropic", wire, nil)
 	if err != nil {
 		t.Fatalf("Admit(valid fable) error = %v", err)

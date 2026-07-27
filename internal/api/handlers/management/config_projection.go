@@ -26,6 +26,8 @@ var functionalConfigProjectionKeys = stringSet(
 	"codex",
 	"codex-header-defaults",
 	"commercial-mode",
+	"credential-concurrency",
+	"credential-in-flight",
 	"debug",
 	"disable-claude-cloak-mode",
 	"disable-cooling",
@@ -55,6 +57,7 @@ var functionalConfigProjectionKeys = stringSet(
 	"usage-statistics-enabled",
 	"video-result-auth-cache-ttl",
 	"ws-auth",
+	"xai",
 )
 
 var functionalConfigSecretKeys = stringSet(
@@ -117,6 +120,10 @@ func canonicalizeFunctionalConfig(cfg *config.Config) *config.Config {
 		return nil
 	}
 	canonical := cfg.CloneForRuntime()
+	canonical.CredentialConcurrency = canonical.CredentialConcurrency.WithDefaults()
+	if reflect.DeepEqual(canonical.CredentialInFlight, config.CredentialInFlightConfig{}) {
+		canonical.CredentialInFlight = config.DefaultCredentialInFlightConfig()
+	}
 	if len(canonical.Payload.Default) == 0 {
 		canonical.Payload.Default = nil
 	}
