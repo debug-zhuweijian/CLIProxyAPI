@@ -12,8 +12,8 @@ import (
 	"strings"
 	"unicode"
 
+	claudemodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/claude/models"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 )
 
 const (
@@ -398,7 +398,7 @@ func decodeWireModel(protocol, wireModel string) (string, error) {
 	if NormalizeProtocol(protocol) != "anthropic" || !strings.HasPrefix(strings.ToLower(trimmed), "claude-fable-5-dd-") {
 		return trimmed, nil
 	}
-	return util.ResolveClaudeModelIDPrefixStrict(trimmed)
+	return claudemodels.ResolveClaudeModelIDPrefixStrict(trimmed)
 }
 
 func containsHeaderToken(headers http.Header, name, token string) bool {

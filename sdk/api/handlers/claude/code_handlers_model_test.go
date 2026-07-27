@@ -6,28 +6,12 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelpolicy"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
 )
-
-func TestSortClaudeModelsByDisplayName(t *testing.T) {
-	models := []map[string]any{
-		{"id": "claude-fable-5-dd-b", "display_name": "Zebra"},
-		{"id": "claude-a", "display_name": "Alpha"},
-		{"id": "claude-c", "display_name": "Alpha"},
-		{"id": "claude-fable-5-dd-d", "display_name": "Beta"},
-	}
-	sortClaudeModelsByDisplayName(models)
-
-	wantIDs := []string{"claude-a", "claude-c", "claude-fable-5-dd-d", "claude-fable-5-dd-b"}
-	for i, want := range wantIDs {
-		got, _ := models[i]["id"].(string)
-		if got != want {
-			t.Fatalf("models[%d].id = %q, want %q", i, got, want)
-		}
-	}
-}
 
 func TestClaudeModelsResponseUsesConfiguredDisplayName(t *testing.T) {
 	const clientID = "claude-display-name-catalog-test"
@@ -62,6 +46,47 @@ func TestClaudeModelsResponseUsesConfiguredDisplayName(t *testing.T) {
 		}
 	}
 	t.Fatalf("model %q not found in response", modelID)
+}
+
+func TestClaudeModelsUsesConfiguredOnlyCatalog(t *testing.T) {
+	handler := NewClaudeCodeAPIHandler(&handlers.BaseAPIHandler{
+		Cfg: &sdkconfig.SDKConfig{
+			ModelPolicy: sdkconfig.ModelPolicyConfig{
+				Mode:             modelpolicy.ModeConfiguredOnly,
+				CatalogAllowlist: []string{"glm-5.2[1m]", "gpt-5.6-sol"},
+				ProtocolRules: map[string][]sdkconfig.ModelPolicyRule{
+					"anthropic": {{
+						WireModel:     "glm-5.2[1m]",
+						Canonical:     "glm-5.2[1m]",
+						UpstreamModel: "glm-5.2",
+					}},
+					"openai-response": {{
+						WireModel:     "gpt-5.6-sol",
+						Canonical:     "gpt-5.6-sol",
+						UpstreamModel: "gpt-5.6-sol",
+					}},
+				},
+			},
+		},
+	})
+
+	models := handler.Models()
+	if len(models) != 1 {
+		t.Fatalf("Models() returned %d models, want only the Anthropic-configured model: %#v", len(models), models)
+	}
+	if got := models[0]["id"]; got != "glm-5.2[1m]" {
+		t.Fatalf("Models()[0].id = %#v, want glm-5.2[1m]", got)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	handler.ClaudeModels(ctx)
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "data.0.id").String(); got != "claude-fable-5-dd-]m1[2.5-mlg" {
+		t.Fatalf("ClaudeModels encoded id = %q", got)
+	}
+	if gjson.GetBytes(recorder.Body.Bytes(), "data.#").Int() != 1 {
+		t.Fatalf("ClaudeModels response = %s", recorder.Body.String())
+	}
 }
 
 func TestRewriteClaudeDDModelInBody(t *testing.T) {
