@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 
@@ -15,92 +14,42 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
-func TestAPICallConfiguredOnlyPolicy(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true}`))
+func TestAPICallUsesRequestProxyURL(t *testing.T) {
+	t.Parallel()
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("proxied"))
 	}))
-	defer upstream.Close()
+	defer proxyServer.Close()
 
-	target, err := url.Parse(upstream.URL)
-	if err != nil {
-		t.Fatalf("parse upstream URL: %v", err)
-	}
-	h := &Handler{cfg: &config.Config{
-		SDKConfig: config.SDKConfig{ModelPolicy: config.ModelPolicyConfig{Mode: "configured-only"}},
-		RemoteManagement: config.RemoteManagement{APICallAllowlist: []config.ManagementAPICallRule{{
-			Host:       target.Host,
-			PathPrefix: "/backend-api/wham/usage",
-			Methods:    []string{http.MethodGet},
-		}}},
-	}}
-	h.cfg.ProxyURL = ""
-
-	tests := []struct {
-		name       string
-		request    apiCallRequest
-		wantStatus int
-	}{
-		{
-			name: "allowlisted quota query",
-			request: apiCallRequest{
-				Method: http.MethodGet,
-				URL:    upstream.URL + "/backend-api/wham/usage",
-			},
-			wantStatus: http.StatusOK,
-		},
-		{
-			name: "unknown path",
-			request: apiCallRequest{
-				Method: http.MethodGet,
-				URL:    upstream.URL + "/unknown",
-			},
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name: "inference path remains blocked even when host is allowed",
-			request: apiCallRequest{
-				Method: http.MethodGet,
-				URL:    upstream.URL + "/v1/responses",
-			},
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name: "body is blocked",
-			request: apiCallRequest{
-				Method: http.MethodGet,
-				URL:    upstream.URL + "/backend-api/wham/usage",
-				Data:   `{"model":"gpt-5.6-sol"}`,
-			},
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name: "host override is blocked",
-			request: apiCallRequest{
-				Method: http.MethodGet,
-				URL:    upstream.URL + "/backend-api/wham/usage",
-				Header: map[string]string{"Host": "example.com"},
-			},
-			wantStatus: http.StatusBadRequest,
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://127.0.0.1:1"},
 		},
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			payload, errMarshal := json.Marshal(test.request)
-			if errMarshal != nil {
-				t.Fatalf("marshal request: %v", errMarshal)
-			}
-			recorder := httptest.NewRecorder()
-			ctx, _ := gin.CreateTestContext(recorder)
-			ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(string(payload)))
-			ctx.Request.Header.Set("Content-Type", "application/json")
+	router := gin.New()
+	router.POST("/", h.APICall)
 
-			h.APICall(ctx)
-			if recorder.Code != test.wantStatus {
-				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, test.wantStatus, recorder.Body.String())
-			}
-		})
+	body := `{"method":"GET","url":"http://upstream.invalid/test","proxy_url":"` + proxyServer.URL + `"}`
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response apiCallResponse
+	if errDecode := json.NewDecoder(recorder.Body).Decode(&response); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("upstream status code = %d, want %d", response.StatusCode, http.StatusCreated)
+	}
+	if response.Body != "proxied" {
+		t.Fatalf("upstream body = %q, want %q", response.Body, "proxied")
 	}
 }
 
@@ -113,7 +62,7 @@ func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 		},
 	}
 
-	transport := h.apiCallTransport(&coreauth.Auth{ProxyURL: "direct"})
+	transport := h.apiCallTransport(&coreauth.Auth{ProxyURL: "direct"}, "")
 	httpTransport, ok := transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("transport type = %T, want *http.Transport", transport)
@@ -132,7 +81,7 @@ func TestAPICallTransportInvalidAuthFallsBackToGlobalProxy(t *testing.T) {
 		},
 	}
 
-	transport := h.apiCallTransport(&coreauth.Auth{ProxyURL: "bad-value"})
+	transport := h.apiCallTransport(&coreauth.Auth{ProxyURL: "bad-value"}, "")
 	httpTransport, ok := transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("transport type = %T, want *http.Transport", transport)
@@ -149,6 +98,56 @@ func TestAPICallTransportInvalidAuthFallsBackToGlobalProxy(t *testing.T) {
 	}
 	if proxyURL == nil || proxyURL.String() != "http://global-proxy.example.com:8080" {
 		t.Fatalf("proxy URL = %v, want http://global-proxy.example.com:8080", proxyURL)
+	}
+}
+
+func TestAPICallTransportRequestProxyOverridesCredentialAndGlobalProxy(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
+		},
+	}
+	auth := &coreauth.Auth{ProxyURL: "http://credential-proxy.example.com:8080"}
+
+	transport := h.apiCallTransport(auth, " http://request-proxy.example.com:8080 ")
+	httpTransport, ok := transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", transport)
+	}
+
+	req, errRequest := http.NewRequest(http.MethodGet, "https://example.com", nil)
+	if errRequest != nil {
+		t.Fatalf("http.NewRequest returned error: %v", errRequest)
+	}
+
+	proxyURL, errProxy := httpTransport.Proxy(req)
+	if errProxy != nil {
+		t.Fatalf("httpTransport.Proxy returned error: %v", errProxy)
+	}
+	if proxyURL == nil || proxyURL.String() != "http://request-proxy.example.com:8080" {
+		t.Fatalf("proxy URL = %v, want http://request-proxy.example.com:8080", proxyURL)
+	}
+}
+
+func TestAPICallTransportInvalidRequestProxyDoesNotFallBack(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
+		},
+	}
+	auth := &coreauth.Auth{ProxyURL: "http://credential-proxy.example.com:8080"}
+
+	transport := h.apiCallTransport(auth, "bad-value")
+	httpTransport, ok := transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", transport)
+	}
+	if httpTransport.Proxy != nil {
+		t.Fatal("expected invalid request proxy to avoid lower-priority proxy settings")
 	}
 }
 
@@ -241,7 +240,7 @@ func TestAPICallTransportAPIKeyAuthFallsBackToConfigProxyURL(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			transport := h.apiCallTransport(tc.auth)
+			transport := h.apiCallTransport(tc.auth, "")
 			httpTransport, ok := transport.(*http.Transport)
 			if !ok {
 				t.Fatalf("transport type = %T, want *http.Transport", transport)

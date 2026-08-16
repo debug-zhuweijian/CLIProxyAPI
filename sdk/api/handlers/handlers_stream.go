@@ -40,31 +40,39 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		close(errChan)
 		return nil, nil, errChan
 	}
-	req, opts := h.pluginExecutorRequest(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, true, execOptions, admission)
-	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
-	if errAdmission := h.sealPluginExecution(entryProtocol, executorPluginID, req, &opts); errAdmission != nil {
+	req, opts := h.pluginExecutorRequest(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, true, execOptions)
+	lifecycle := h.newRequestLifecycleTracker(ctx, entryProtocol, modelName, originalRequestedModel, true, opts.Metadata, execOptions.SkipInterceptorPluginID)
+	var interceptErr *interfaces.ErrorMessage
+	req, opts, interceptErr = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
+	if interceptErr != nil {
+		lifecycle.completeError(ctx, interceptErr)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- executionErrorMessage(errAdmission)
+		errChan <- interceptErr
 		close(errChan)
 		return nil, nil, errChan
 	}
-	req, opts = h.applyRequestInterceptorsAfterPluginExecutorRoute(ctx, host, executorPluginID, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
-	if errAdmission := h.admitPluginExecution(entryProtocol, executorPluginID, req, &opts); errAdmission != nil {
+	req, opts, interceptErr = h.applyRequestInterceptorsAfterPluginExecutorRoute(ctx, host, executorPluginID, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
+	if interceptErr != nil {
+		lifecycle.completeError(ctx, interceptErr)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- executionErrorMessage(errAdmission)
+		errChan <- interceptErr
 		close(errChan)
 		return nil, nil, errChan
 	}
 	streamResult, errStream := host.ExecutePluginExecutorStream(ctx, executorPluginID, req, opts)
 	if errStream != nil {
+		errMsg := executionErrorMessage(errStream)
+		lifecycle.completeError(ctx, errMsg)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- executionErrorMessage(errStream)
+		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
 	}
 	if streamResult == nil {
+		errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor returned nil stream")}
+		lifecycle.completeError(ctx, errMsg)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor returned nil stream")}
+		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
 	}
@@ -74,18 +82,28 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
 	rawStreamHeaders := cloneHeader(streamResult.Headers)
 	baseStreamHeaders := cloneHeader(streamResult.Headers)
+	// Request headers and request bodies are stream-invariant. Keep a private snapshot
+	// and clone into each interceptor call so plugins cannot mutate shared storage.
+	// Schema v3+ payload chunks omit these bodies (host also strips per plugin).
+	var streamRequestHeaders http.Header
+	var streamOriginalRequest []byte
+	var streamRequestBody []byte
 	applyStreamHeaders := func(headers http.Header) {
 		rawStreamHeaders = finalInterceptorHeaders(rawStreamHeaders, headers)
 	}
 	if streamInterceptorsActive {
+		streamRequestHeaders = cloneHeader(opts.Headers)
+		streamOriginalRequest = cloneBytes(opts.OriginalRequest)
+		streamRequestBody = cloneBytes(req.Payload)
 		intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+			RequestID:       lifecycle.requestID(),
 			SourceFormat:    responseProtocol,
 			Model:           modelName,
 			RequestedModel:  originalRequestedModel,
-			RequestHeaders:  cloneHeader(opts.Headers),
+			RequestHeaders:  cloneHeader(streamRequestHeaders),
 			ResponseHeaders: cloneHeader(rawStreamHeaders),
-			OriginalRequest: cloneBytes(opts.OriginalRequest),
-			RequestBody:     cloneBytes(req.Payload),
+			OriginalRequest: cloneBytes(streamOriginalRequest),
+			RequestBody:     cloneBytes(streamRequestBody),
 			ChunkIndex:      pluginapi.StreamChunkHeaderInitIndex,
 			Metadata:        opts.Metadata,
 		}, execOptions.SkipInterceptorPluginID)
@@ -108,7 +126,17 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		close(closed)
 		chunks = closed
 	}
+	var responseSSEValidator *sseJSONValidationState
+	if responseProtocol == "openai-response" {
+		responseSSEValidator = &sseJSONValidationState{}
+	}
 	go func() {
+		completionOutcome := pluginapi.RequestCompletionSucceeded
+		completionStatus := http.StatusOK
+		var completionErr error
+		defer func() {
+			lifecycle.complete(completionOutcome, completionStatus, completionErr)
+		}()
 		defer close(dataChan)
 		defer close(errChan)
 		chunkIndex := 0
@@ -116,15 +144,45 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		for {
 			chunk, ok, canceled := nextStreamChunk(ctx, nil, nil, chunks)
 			if canceled {
+				completionOutcome = pluginapi.RequestCompletionCanceled
+				completionStatus = 0
+				if ctx != nil {
+					completionErr = ctx.Err()
+				}
 				return
 			}
 			if !ok {
+				if responseSSEValidator != nil {
+					if errValidate := responseSSEValidator.Finish(); errValidate != nil {
+						completionOutcome = pluginapi.RequestCompletionFailed
+						completionStatus = http.StatusBadGateway
+						completionErr = errValidate
+						select {
+						case errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errValidate}:
+						case <-done:
+							completionOutcome = pluginapi.RequestCompletionCanceled
+							completionStatus = 0
+							if ctx != nil {
+								completionErr = ctx.Err()
+							}
+						}
+					}
+				}
 				return
 			}
 			if chunk.Err != nil {
+				errMsg := executionErrorMessage(chunk.Err)
+				completionOutcome = pluginapi.RequestCompletionFailed
+				completionStatus = errMsg.StatusCode
+				completionErr = chunk.Err
 				select {
-				case errChan <- executionErrorMessage(chunk.Err):
+				case errChan <- errMsg:
 				case <-done:
+					completionOutcome = pluginapi.RequestCompletionCanceled
+					completionStatus = 0
+					if ctx != nil {
+						completionErr = ctx.Err()
+					}
 				}
 				return
 			}
@@ -133,19 +191,25 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 			}
 			payload := cloneBytes(chunk.Payload)
 			if streamInterceptorsActive {
-				intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+				chunkReq := pluginapi.StreamChunkInterceptRequest{
+					RequestID:       lifecycle.requestID(),
 					SourceFormat:    responseProtocol,
 					Model:           modelName,
 					RequestedModel:  originalRequestedModel,
-					RequestHeaders:  cloneHeader(opts.Headers),
+					RequestHeaders:  cloneHeader(streamRequestHeaders),
 					ResponseHeaders: cloneHeader(rawStreamHeaders),
-					OriginalRequest: cloneBytes(opts.OriginalRequest),
-					RequestBody:     cloneBytes(req.Payload),
 					Body:            payload,
 					HistoryChunks:   cloneByteSlices(historyChunks),
 					ChunkIndex:      chunkIndex,
 					Metadata:        opts.Metadata,
-				}, execOptions.SkipInterceptorPluginID)
+				}
+				// Re-evaluate each chunk so mid-stream plugin reloads stay correct.
+				// Schema v3+ omits bodies here (one header-init clone only).
+				if streamChunkPayloadIncludesRequestBody(interceptorHost) {
+					chunkReq.OriginalRequest = cloneBytes(streamOriginalRequest)
+					chunkReq.RequestBody = cloneBytes(streamRequestBody)
+				}
+				intercepted := interceptStreamChunk(ctx, interceptorHost, chunkReq, execOptions.SkipInterceptorPluginID)
 				applyStreamHeaders(intercepted.Headers)
 				if len(intercepted.Body) > 0 {
 					payload = cloneBytes(intercepted.Body)
@@ -157,13 +221,26 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 			} else {
 				chunkIndex++
 			}
-			if responseProtocol == "openai-response" {
-				if errValidate := validateSSEDataJSON(payload); errValidate != nil {
+			if responseSSEValidator != nil {
+				validatedPayload, errValidate := responseSSEValidator.AddChunk(payload)
+				if errValidate != nil {
+					completionOutcome = pluginapi.RequestCompletionFailed
+					completionStatus = http.StatusBadGateway
+					completionErr = errValidate
 					select {
 					case errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errValidate}:
 					case <-done:
+						completionOutcome = pluginapi.RequestCompletionCanceled
+						completionStatus = 0
+						if ctx != nil {
+							completionErr = ctx.Err()
+						}
 					}
 					return
+				}
+				payload = validatedPayload
+				if len(payload) == 0 {
+					continue
 				}
 			}
 			select {
@@ -172,6 +249,11 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 					historyChunks = appendStreamInterceptorHistory(historyChunks, payload)
 				}
 			case <-done:
+				completionOutcome = pluginapi.RequestCompletionCanceled
+				completionStatus = 0
+				if ctx != nil {
+					completionErr = ctx.Err()
+				}
 				return
 			}
 		}
@@ -185,16 +267,8 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 
 func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
-	admission, admittedModel, admittedJSON, admissionErr := h.admitBeforeRouter(ctx, entryProtocol, modelName, rawJSON, execOptions)
-	if admissionErr != nil {
-		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- admissionErr
-		close(errChan)
-		return nil, nil, errChan
-	}
-	modelName, rawJSON = admittedModel, admittedJSON
-	routeDecision, preparedRoute := preparedModelRouteFromContext(ctx)
-	if !preparedRoute || admission.Canonical != "" {
+	routeDecision, preparedRoute := preparedModelRouteFromContext(ctx, execOptions.SkipRouterPluginID)
+	if !preparedRoute {
 		routeDecision = h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)
 	}
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
@@ -232,6 +306,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		Payload: payload,
 	}
 	afterAuthCapture := &requestAfterAuthCapture{}
+	lifecycle := h.newRequestLifecycleTracker(ctx, entryProtocol, normalizedModel, originalRequestedModel, true, reqMeta, execOptions.SkipInterceptorPluginID)
 	opts := coreexecutor.Options{
 		Stream:                      true,
 		Alt:                         alt,
@@ -240,33 +315,33 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		ResponseFormat:              sdktranslator.FromString(responseProtocol),
 		Headers:                     modelExecutionHeaders(ctx, execOptions.Headers),
 		Query:                       modelExecutionQuery(ctx, execOptions.Query),
-		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, execOptions.SkipInterceptorPluginID),
+		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, lifecycle.requestID(), execOptions.SkipInterceptorPluginID),
 	}
 	opts.Metadata = reqMeta
-	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	var interceptErr *interfaces.ErrorMessage
+	req, opts, interceptErr = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
+	if interceptErr != nil {
+		lifecycle.completeError(ctx, interceptErr)
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- interceptErr
+		close(errChan)
+		return nil, nil, errChan
+	}
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
+		errMsg := executionErrorMessage(err)
+		lifecycle.completeError(ctx, errMsg)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
 	}
 	if streamResult == nil {
+		errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("auth manager returned nil stream")}
+		lifecycle.completeError(ctx, errMsg)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("auth manager returned nil stream")}
+		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
 	}
@@ -289,6 +364,12 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	streamClosedBeforeRead := false
 	streamCanceledBeforeRead := false
 	streamHeaderInitialized := false
+	// Request headers/bodies are stream-invariant after after-auth capture. Keep a private
+	// snapshot and clone into each interceptor call so plugins cannot mutate shared storage.
+	// Schema v3+ payload chunks omit these bodies (host also strips per plugin).
+	var streamRequestHeaders http.Header
+	var streamOriginalRequest []byte
+	var streamRequestBody []byte
 
 	applyStreamHeaders := func(headers http.Header) {
 		rawStreamHeaders = finalInterceptorHeaders(rawStreamHeaders, headers)
@@ -299,14 +380,18 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			return
 		}
 		executedReq, executedOpts := executedRequest()
+		streamRequestHeaders = cloneHeader(executedOpts.Headers)
+		streamOriginalRequest = cloneBytes(executedOpts.OriginalRequest)
+		streamRequestBody = cloneBytes(executedReq.Payload)
 		intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+			RequestID:       lifecycle.requestID(),
 			SourceFormat:    responseProtocol,
 			Model:           normalizedModel,
 			RequestedModel:  originalRequestedModel,
-			RequestHeaders:  cloneHeader(executedOpts.Headers),
+			RequestHeaders:  cloneHeader(streamRequestHeaders),
 			ResponseHeaders: cloneHeader(rawStreamHeaders),
-			OriginalRequest: cloneBytes(executedOpts.OriginalRequest),
-			RequestBody:     cloneBytes(executedReq.Payload),
+			OriginalRequest: cloneBytes(streamOriginalRequest),
+			RequestBody:     cloneBytes(streamRequestBody),
 			ChunkIndex:      pluginapi.StreamChunkHeaderInitIndex,
 			Metadata:        executedOpts.Metadata,
 		}, execOptions.SkipInterceptorPluginID)
@@ -314,24 +399,34 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		streamHeaderInitialized = true
 	}
 
+	var responseSSEValidator *sseJSONValidationState
+	if responseProtocol == "openai-response" {
+		responseSSEValidator = &sseJSONValidationState{}
+	}
+
 	transformStreamPayload := func(payload []byte, chunkIndex *int, historyChunks [][]byte) ([]byte, bool, *interfaces.ErrorMessage) {
 		applyStreamHeaderInit()
 		payload = cloneBytes(payload)
 		if streamInterceptorsActive {
-			executedReq, executedOpts := executedRequest()
-			intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+			chunkReq := pluginapi.StreamChunkInterceptRequest{
+				RequestID:       lifecycle.requestID(),
 				SourceFormat:    responseProtocol,
 				Model:           normalizedModel,
 				RequestedModel:  originalRequestedModel,
-				RequestHeaders:  cloneHeader(executedOpts.Headers),
+				RequestHeaders:  cloneHeader(streamRequestHeaders),
 				ResponseHeaders: cloneHeader(rawStreamHeaders),
-				OriginalRequest: cloneBytes(executedOpts.OriginalRequest),
-				RequestBody:     cloneBytes(executedReq.Payload),
 				Body:            payload,
 				HistoryChunks:   cloneByteSlices(historyChunks),
 				ChunkIndex:      *chunkIndex,
-				Metadata:        executedOpts.Metadata,
-			}, execOptions.SkipInterceptorPluginID)
+				Metadata:        opts.Metadata,
+			}
+			// Re-evaluate each chunk so mid-stream plugin reloads stay correct.
+			// Schema v3+ omits bodies here (one header-init clone only).
+			if streamChunkPayloadIncludesRequestBody(interceptorHost) {
+				chunkReq.OriginalRequest = cloneBytes(streamOriginalRequest)
+				chunkReq.RequestBody = cloneBytes(streamRequestBody)
+			}
+			intercepted := interceptStreamChunk(ctx, interceptorHost, chunkReq, execOptions.SkipInterceptorPluginID)
 			applyStreamHeaders(intercepted.Headers)
 			if len(intercepted.Body) > 0 {
 				payload = cloneBytes(intercepted.Body)
@@ -343,9 +438,14 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		} else {
 			(*chunkIndex)++
 		}
-		if responseProtocol == "openai-response" {
-			if errValidate := validateSSEDataJSON(payload); errValidate != nil {
+		if responseSSEValidator != nil {
+			validatedPayload, errValidate := responseSSEValidator.AddChunk(payload)
+			if errValidate != nil {
 				return nil, false, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errValidate}
+			}
+			payload = validatedPayload
+			if len(payload) == 0 {
+				return nil, false, nil
 			}
 		}
 		return payload, true, nil
@@ -425,7 +525,12 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		bootstrapRetries++
 		retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 		if retryErr != nil {
-			bootstrapErr = executionErrorMessage(enrichAuthSelectionError(retryErr, providers, normalizedModel))
+			originalBootstrapErr := executionErrorMessage(bootstrapStreamErr)
+			if isAuthSelectionUnavailable(retryErr) && originalBootstrapErr.StatusCode >= http.StatusInternalServerError {
+				bootstrapErr = originalBootstrapErr
+			} else {
+				bootstrapErr = executionErrorMessage(enrichAuthSelectionError(retryErr, providers, normalizedModel))
+			}
 			break
 		}
 		if retryResult == nil {
@@ -440,6 +545,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		bootstrapPayload = nil
 		bootstrapChunkIndex = 0
 		bootstrapHistoryChunks = nil
+		if responseSSEValidator != nil {
+			responseSSEValidator = &sseJSONValidationState{}
+		}
 		chunks = retryResult.Chunks
 		if chunks == nil {
 			closed := make(chan coreexecutor.StreamChunk)
@@ -456,9 +564,20 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	errChan := make(chan *interfaces.ErrorMessage, 1)
 
 	go func() {
+		completionOutcome := pluginapi.RequestCompletionSucceeded
+		completionStatus := http.StatusOK
+		var completionErr error
+		defer func() {
+			lifecycle.complete(completionOutcome, completionStatus, completionErr)
+		}()
 		defer close(dataChan)
 		defer close(errChan)
 		if streamCanceledBeforeRead {
+			completionOutcome = pluginapi.RequestCompletionCanceled
+			completionStatus = 0
+			if ctx != nil {
+				completionErr = ctx.Err()
+			}
 			return
 		}
 
@@ -489,7 +608,17 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		}
 
 		if bootstrapErr != nil {
-			_ = sendErr(bootstrapErr)
+			completionOutcome = pluginapi.RequestCompletionFailed
+			if bootstrapErr.DirectResponse {
+				completionOutcome = pluginapi.RequestCompletionRejected
+			}
+			completionStatus = bootstrapErr.StatusCode
+			completionErr = bootstrapErr.Error
+			if !sendErr(bootstrapErr) && ctx != nil && ctx.Err() != nil {
+				completionOutcome = pluginapi.RequestCompletionCanceled
+				completionStatus = 0
+				completionErr = ctx.Err()
+			}
 			return
 		}
 
@@ -497,6 +626,11 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		historyChunks := bootstrapHistoryChunks
 		if bootstrapPayload != nil {
 			if okSendData := sendData(bootstrapPayload); !okSendData {
+				completionOutcome = pluginapi.RequestCompletionCanceled
+				completionStatus = 0
+				if ctx != nil {
+					completionErr = ctx.Err()
+				}
 				return
 			}
 			if streamInterceptorsActive {
@@ -505,11 +639,36 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		}
 		for {
 			chunk, ok, canceled := nextStreamChunk(ctx, nil, &streamClosedBeforeRead, chunks)
-			if canceled || !ok {
+			if canceled {
+				completionOutcome = pluginapi.RequestCompletionCanceled
+				completionStatus = 0
+				if ctx != nil {
+					completionErr = ctx.Err()
+				}
+				return
+			}
+			if !ok {
+				if responseSSEValidator != nil {
+					if errValidate := responseSSEValidator.Finish(); errValidate != nil {
+						errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errValidate}
+						completionOutcome = pluginapi.RequestCompletionFailed
+						completionStatus = errMsg.StatusCode
+						completionErr = errMsg.Error
+						_ = sendErr(errMsg)
+					}
+				}
 				return
 			}
 			if chunk.Err != nil {
-				_ = sendErr(executionErrorMessage(chunk.Err))
+				errMsg := executionErrorMessage(chunk.Err)
+				completionOutcome = pluginapi.RequestCompletionFailed
+				completionStatus = errMsg.StatusCode
+				completionErr = chunk.Err
+				if !sendErr(errMsg) && ctx != nil && ctx.Err() != nil {
+					completionOutcome = pluginapi.RequestCompletionCanceled
+					completionStatus = 0
+					completionErr = ctx.Err()
+				}
 				return
 			}
 			if len(chunk.Payload) == 0 {
@@ -517,13 +676,25 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			}
 			payload, deliverable, errMsg := transformStreamPayload(chunk.Payload, &chunkIndex, historyChunks)
 			if errMsg != nil {
-				_ = sendErr(errMsg)
+				completionOutcome = pluginapi.RequestCompletionFailed
+				completionStatus = errMsg.StatusCode
+				completionErr = errMsg.Error
+				if !sendErr(errMsg) && ctx != nil && ctx.Err() != nil {
+					completionOutcome = pluginapi.RequestCompletionCanceled
+					completionStatus = 0
+					completionErr = ctx.Err()
+				}
 				return
 			}
 			if !deliverable {
 				continue
 			}
 			if okSendData := sendData(payload); !okSendData {
+				completionOutcome = pluginapi.RequestCompletionCanceled
+				completionStatus = 0
+				if ctx != nil {
+					completionErr = ctx.Err()
+				}
 				return
 			}
 			if streamInterceptorsActive {
@@ -534,31 +705,115 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	return dataChan, upstreamHeaders, errChan
 }
 
-func validateSSEDataJSON(chunk []byte) error {
-	for _, line := range bytes.Split(chunk, []byte("\n")) {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
+type sseJSONValidationState struct {
+	pending    []byte
+	pendingErr error
+}
+
+func (s *sseJSONValidationState) AddChunk(chunk []byte) ([]byte, error) {
+	if s.pendingErr != nil {
+		errPending := s.pendingErr
+		s.pendingErr = nil
+		return nil, errPending
+	}
+	if len(chunk) == 0 {
+		return nil, nil
+	}
+	chunk = bytes.ReplaceAll(chunk, []byte("\r\n"), []byte("\n"))
+	chunk = bytes.ReplaceAll(chunk, []byte("\r"), []byte("\n"))
+	if len(s.pending) > 0 && !bytes.HasSuffix(s.pending, []byte("\n")) && !bytes.HasPrefix(chunk, []byte("\n")) {
+		first := bytes.TrimSpace(bytes.SplitN(chunk, []byte("\n"), 2)[0])
+		if bytes.HasPrefix(first, []byte("data:")) || bytes.HasPrefix(first, []byte("event:")) {
+			s.pending = append(s.pending, '\n')
 		}
+	}
+	s.pending = append(s.pending, chunk...)
+
+	var output []byte
+	for {
+		frameEnd := bytes.Index(s.pending, []byte("\n\n"))
+		if frameEnd < 0 {
+			break
+		}
+		frameEnd += 2
+		frame := s.pending[:frameEnd]
+		if errValidate := validateSSEFrameDataJSON(frame); errValidate != nil {
+			if len(output) > 0 {
+				s.pending = s.pending[:0]
+				s.pendingErr = errValidate
+				return output, nil
+			}
+			return nil, errValidate
+		}
+		output = append(output, frame...)
+		copy(s.pending, s.pending[frameEnd:])
+		s.pending = s.pending[:len(s.pending)-frameEnd]
+	}
+
+	if len(bytes.TrimSpace(s.pending)) == 0 {
+		s.pending = s.pending[:0]
+		return output, nil
+	}
+	payload, found := sseJSONValidationDataPayload(s.pending)
+	payload = bytes.TrimSpace(payload)
+	if !found || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || json.Valid(payload) {
+		output = append(output, s.pending...)
+		s.pending = s.pending[:0]
+	}
+	return output, nil
+}
+
+func (s *sseJSONValidationState) Finish() error {
+	if s.pendingErr != nil {
+		errPending := s.pendingErr
+		s.pendingErr = nil
+		s.pending = nil
+		return errPending
+	}
+	if len(bytes.TrimSpace(s.pending)) == 0 {
+		s.pending = nil
+		return nil
+	}
+	errValidate := validateSSEFrameDataJSON(s.pending)
+	s.pending = nil
+	return errValidate
+}
+
+func sseJSONValidationDataPayload(frame []byte) ([]byte, bool) {
+	var payload []byte
+	found := false
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		line = bytes.TrimSpace(line)
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
-		data := bytes.TrimSpace(line[5:])
-		if len(data) == 0 {
-			continue
+		if found {
+			payload = append(payload, '\n')
 		}
-		if bytes.Equal(data, []byte("[DONE]")) {
-			continue
-		}
-		if json.Valid(data) {
-			continue
-		}
-		const max = 512
-		preview := data
-		if len(preview) > max {
-			preview = preview[:max]
-		}
-		return fmt.Errorf("invalid SSE data JSON (len=%d): %q", len(data), preview)
+		payload = append(payload, bytes.TrimSpace(line[len("data:"):])...)
+		found = true
 	}
-	return nil
+	return payload, found
+}
+
+func validateSSEFrameDataJSON(frame []byte) error {
+	payload, found := sseJSONValidationDataPayload(frame)
+	payload = bytes.TrimSpace(payload)
+	if !found || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || json.Valid(payload) {
+		return nil
+	}
+	const max = 512
+	preview := payload
+	if len(preview) > max {
+		preview = preview[:max]
+	}
+	return fmt.Errorf("invalid SSE data JSON (len=%d): %q", len(payload), preview)
+}
+
+func validateSSEDataJSON(chunk []byte) error {
+	state := &sseJSONValidationState{}
+	if _, errAdd := state.AddChunk(chunk); errAdd != nil {
+		return errAdd
+	}
+	return state.Finish()
 }

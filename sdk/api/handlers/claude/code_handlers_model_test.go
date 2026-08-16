@@ -48,45 +48,38 @@ func TestClaudeModelsResponseUsesConfiguredDisplayName(t *testing.T) {
 	t.Fatalf("model %q not found in response", modelID)
 }
 
-func TestClaudeModelsUsesConfiguredOnlyCatalog(t *testing.T) {
-	handler := NewClaudeCodeAPIHandler(&handlers.BaseAPIHandler{
-		Cfg: &sdkconfig.SDKConfig{
-			ModelPolicy: sdkconfig.ModelPolicyConfig{
-				Mode:             modelpolicy.ModeConfiguredOnly,
-				CatalogAllowlist: []string{"glm-5.2[1m]", "gpt-5.6-sol"},
-				ProtocolRules: map[string][]sdkconfig.ModelPolicyRule{
-					"anthropic": {{
-						WireModel:     "glm-5.2[1m]",
-						Canonical:     "glm-5.2[1m]",
-						UpstreamModel: "glm-5.2",
-					}},
-					"openai-response": {{
-						WireModel:     "gpt-5.6-sol",
-						Canonical:     "gpt-5.6-sol",
-						UpstreamModel: "gpt-5.6-sol",
-					}},
-				},
-			},
-		},
+func TestClaudeModelsResponseDisablesModelListCloaking(t *testing.T) {
+	const clientID = "claude-disable-model-list-cloaking-test"
+	const modelID = "gpt-disable-model-list-cloaking-test"
+	registryRef := registry.GetGlobalRegistry()
+	registryRef.RegisterClient(clientID, "claude", []*registry.ModelInfo{{
+		ID: modelID, Object: "model", OwnedBy: "test",
+	}})
+	t.Cleanup(func() {
+		registryRef.UnregisterClient(clientID)
 	})
-
-	models := handler.Models()
-	if len(models) != 1 {
-		t.Fatalf("Models() returned %d models, want only the Anthropic-configured model: %#v", len(models), models)
-	}
-	if got := models[0]["id"]; got != "glm-5.2[1m]" {
-		t.Fatalf("Models()[0].id = %#v, want glm-5.2[1m]", got)
-	}
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	handler.ClaudeModels(ctx)
-	if got := gjson.GetBytes(recorder.Body.Bytes(), "data.0.id").String(); got != "claude-fable-5-dd-]m1[2.5-mlg" {
-		t.Fatalf("ClaudeModels encoded id = %q", got)
+	baseHandler := &handlers.BaseAPIHandler{Cfg: &sdkconfig.SDKConfig{
+		ClaudeCode: sdkconfig.ClaudeCodeConfig{DisableCloakingModelList: true},
+	}}
+	NewClaudeCodeAPIHandler(baseHandler).ClaudeModels(ctx)
+
+	var response struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
-	if gjson.GetBytes(recorder.Body.Bytes(), "data.#").Int() != 1 {
-		t.Fatalf("ClaudeModels response = %s", recorder.Body.String())
+	if errUnmarshal := json.Unmarshal(recorder.Body.Bytes(), &response); errUnmarshal != nil {
+		t.Fatalf("decode response: %v", errUnmarshal)
 	}
+	for _, model := range response.Data {
+		if model.ID == modelID {
+			return
+		}
+	}
+	t.Fatalf("uncloaked model %q not found in response", modelID)
 }
 
 func TestRewriteClaudeDDModelInBody(t *testing.T) {
