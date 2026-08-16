@@ -19,9 +19,11 @@ const (
 )
 
 var functionalConfigProjectionKeys = stringSet(
+	"antigravity",
 	"antigravity-signature-bypass-strict",
 	"antigravity-signature-cache-enabled",
 	"auth-auto-refresh-workers",
+	"claude-code",
 	"claude-header-defaults",
 	"codex",
 	"codex-header-defaults",

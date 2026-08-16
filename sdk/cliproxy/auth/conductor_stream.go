@@ -227,7 +227,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if errCtx := ctx.Err(); errCtx != nil {
 			return nil, errCtx
 		}
-		streamResult, errStream := m.streamApproved(ctx, executor, auth, provider, execReq, execOpts)
+		execOpts, errStream := m.sealModelExecution(auth, provider, executor, execReq, execOpts)
+		var streamResult *cliproxyexecutor.StreamResult
+		if errStream == nil {
+			streamResult, errStream = m.streamApproved(ctx, executor, auth, provider, execReq, execOpts)
+		}
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -311,7 +315,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					m.replaceHomeExecutionLifecycleAuth(execOpts.ExecutionLifecycle, auth)
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
-					retryStream, retryErr := executor.ExecuteStream(ctx, auth, execReq, execOpts)
+					execOpts, retryErr := m.sealModelExecution(auth, provider, executor, execReq, execOpts)
+					var retryStream *cliproxyexecutor.StreamResult
+					if retryErr == nil {
+						retryStream, retryErr = m.streamApproved(ctx, executor, auth, provider, execReq, execOpts)
+					}
 					retryStream, retryErr = validateStreamResult(retryStream, retryErr)
 					if retryErr != nil {
 						if errCtx := ctx.Err(); errCtx != nil {

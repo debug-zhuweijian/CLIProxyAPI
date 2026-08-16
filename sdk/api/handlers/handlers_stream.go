@@ -40,7 +40,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		close(errChan)
 		return nil, nil, errChan
 	}
-	req, opts := h.pluginExecutorRequest(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, true, execOptions)
+	req, opts := h.pluginExecutorRequest(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, true, execOptions, admission)
 	lifecycle := h.newRequestLifecycleTracker(ctx, entryProtocol, modelName, originalRequestedModel, true, opts.Metadata, execOptions.SkipInterceptorPluginID)
 	var interceptErr *interfaces.ErrorMessage
 	req, opts, interceptErr = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
@@ -51,11 +51,27 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		close(errChan)
 		return nil, nil, errChan
 	}
+	if errSeal := h.sealPluginExecution(entryProtocol, executorPluginID, req, &opts); errSeal != nil {
+		errMsg := executionErrorMessage(errSeal)
+		lifecycle.completeError(ctx, errMsg)
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- errMsg
+		close(errChan)
+		return nil, nil, errChan
+	}
 	req, opts, interceptErr = h.applyRequestInterceptorsAfterPluginExecutorRoute(ctx, host, executorPluginID, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
 	if interceptErr != nil {
 		lifecycle.completeError(ctx, interceptErr)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- interceptErr
+		close(errChan)
+		return nil, nil, errChan
+	}
+	if errAdmit := h.admitPluginExecution(entryProtocol, executorPluginID, req, &opts); errAdmit != nil {
+		errMsg := executionErrorMessage(errAdmit)
+		lifecycle.completeError(ctx, errMsg)
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
 	}
@@ -267,6 +283,14 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 
 func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
+	admission, admittedModel, admittedJSON, admissionErr := h.admitBeforeRouter(ctx, entryProtocol, modelName, rawJSON, execOptions)
+	if admissionErr != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- admissionErr
+		close(errChan)
+		return nil, nil, errChan
+	}
+	modelName, rawJSON = admittedModel, admittedJSON
 	routeDecision, preparedRoute := preparedModelRouteFromContext(ctx, execOptions.SkipRouterPluginID)
 	if !preparedRoute {
 		routeDecision = h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)

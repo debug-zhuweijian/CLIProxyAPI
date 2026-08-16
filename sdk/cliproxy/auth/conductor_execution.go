@@ -349,7 +349,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if !restoreExecutionModel {
 				execReq = attachResolvedAPIKeyModelInfo(routing, execReq, auth, routeModel, upstreamModel)
 			}
-			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+			execOpts, errExec := m.sealModelExecution(auth, provider, executor, execReq, execOpts)
+			var resp cliproxyexecutor.Response
+			if errExec == nil {
+				resp, errExec = m.executeApproved(execCtx, executor, auth, provider, execReq, execOpts)
+			}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -485,7 +489,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if !restoreExecutionModel {
 				execReq = attachResolvedAPIKeyModelInfo(routing, execReq, auth, routeModel, upstreamModel)
 			}
-			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
+			execOpts, errExec := m.sealModelExecution(auth, provider, executor, execReq, execOpts)
+			var resp cliproxyexecutor.Response
+			if errExec == nil {
+				resp, errExec = m.countApproved(execCtx, executor, auth, provider, execReq, execOpts)
+			}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx

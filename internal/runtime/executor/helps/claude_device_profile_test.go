@@ -179,6 +179,42 @@ func TestApplyClaudeLegacyDeviceHeadersAcceptsConfiguredMeasuredBaseline(t *test
 	}
 }
 
+func TestApplyClaudeLegacyDeviceHeadersUsesMeasuredBaselineWhenUnconfigured(t *testing.T) {
+	request, errRequest := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	if errRequest != nil {
+		t.Fatal(errRequest)
+	}
+
+	ApplyClaudeLegacyDeviceHeaders(request, nil, nil, false)
+
+	if got := request.Header.Get("X-Stainless-Os"); got != defaultClaudeFingerprintOS {
+		t.Fatalf("X-Stainless-Os = %q, want baseline %q", got, defaultClaudeFingerprintOS)
+	}
+	if got := request.Header.Get("X-Stainless-Arch"); got != defaultClaudeFingerprintArch {
+		t.Fatalf("X-Stainless-Arch = %q, want baseline %q", got, defaultClaudeFingerprintArch)
+	}
+}
+
+func TestApplyClaudeLegacyDeviceHeadersPreservesConfiguredPlatformForUnconfirmedClient(t *testing.T) {
+	request, errRequest := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	if errRequest != nil {
+		t.Fatal(errRequest)
+	}
+	cfg := &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+		OS:   "MacOS",
+		Arch: "arm64",
+	}}
+
+	ApplyClaudeLegacyDeviceHeaders(request, nil, cfg, false)
+
+	if got := request.Header.Get("X-Stainless-Os"); got != "MacOS" {
+		t.Fatalf("X-Stainless-Os = %q, want configured MacOS", got)
+	}
+	if got := request.Header.Get("X-Stainless-Arch"); got != "arm64" {
+		t.Fatalf("X-Stainless-Arch = %q, want configured arm64", got)
+	}
+}
+
 func TestResolveClaudeDeviceProfileRequiredHomeReadWithoutCandidate(t *testing.T) {
 	client := newFakeClaudeDeviceProfileKVClient()
 	auth := &cliproxyauth.Auth{ID: "auth-1"}
