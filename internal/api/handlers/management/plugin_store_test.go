@@ -109,6 +109,44 @@ func TestPluginStoreDirectManifestPinsRequestedVersionArtifacts(t *testing.T) {
 	}
 }
 
+func TestNewPluginStoreClientHonorsNoProxyWithConfiguredProxy(t *testing.T) {
+	t.Setenv("NO_PROXY", "api.github.com,release-assets.githubusercontent.com")
+
+	h := &Handler{}
+	storeClient := h.newPluginStoreClient("http://proxy.example:8080", "", nil)
+	httpClient, okClient := storeClient.HTTPClient.(*http.Client)
+	if !okClient {
+		t.Fatalf("HTTPClient = %T, want *http.Client", storeClient.HTTPClient)
+	}
+	transport, okTransport := httpClient.Transport.(*http.Transport)
+	if !okTransport || transport.Proxy == nil {
+		t.Fatalf("Transport = %T, want configured *http.Transport", httpClient.Transport)
+	}
+
+	for _, target := range []string{
+		"https://api.github.com/repos/example/plugin/releases/latest",
+		"https://release-assets.githubusercontent.com/example/plugin.zip",
+	} {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		proxy, errProxy := transport.Proxy(req)
+		if errProxy != nil {
+			t.Fatalf("Proxy(%s) error = %v", target, errProxy)
+		}
+		if proxy != nil {
+			t.Fatalf("Proxy(%s) = %v, want direct", target, proxy)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://upstream.example/v1/models", nil)
+	proxy, errProxy := transport.Proxy(req)
+	if errProxy != nil {
+		t.Fatalf("Proxy(upstream) error = %v", errProxy)
+	}
+	if proxy == nil || proxy.Host != "proxy.example:8080" {
+		t.Fatalf("Proxy(upstream) = %v, want configured proxy", proxy)
+	}
+}
+
 func TestListPluginStoreUsesVersionFromInstalledFilename(t *testing.T) {
 	t.Parallel()
 

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -20,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/net/http/httpproxy"
 	"gopkg.in/yaml.v3"
 )
 
@@ -540,8 +543,40 @@ func (h *Handler) newPluginStoreClient(proxyURL string, registryURL string, stor
 	client := &http.Client{}
 	if strings.TrimSpace(proxyURL) != "" {
 		util.SetProxy(&sdkconfig.SDKConfig{ProxyURL: strings.TrimSpace(proxyURL)}, client)
+		applyPluginStoreNoProxy(client, proxyURL)
 	}
 	return pluginstore.Client{HTTPClient: client, RegistryURL: registryURL, Auth: storeAuth}
+}
+
+func applyPluginStoreNoProxy(client *http.Client, proxyURL string) {
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport.Proxy == nil {
+		return
+	}
+	noProxy := strings.TrimSpace(os.Getenv("NO_PROXY"))
+	if noProxy == "" {
+		noProxy = strings.TrimSpace(os.Getenv("no_proxy"))
+	}
+	if noProxy == "" {
+		return
+	}
+
+	configuredProxy := transport.Proxy
+	bypassProxy := (&httpproxy.Config{
+		HTTPProxy:  strings.TrimSpace(proxyURL),
+		HTTPSProxy: strings.TrimSpace(proxyURL),
+		NoProxy:    noProxy,
+	}).ProxyFunc()
+	transport.Proxy = func(req *http.Request) (*url.URL, error) {
+		proxy, errProxy := bypassProxy(req.URL)
+		if errProxy != nil {
+			return nil, errProxy
+		}
+		if proxy == nil {
+			return nil, nil
+		}
+		return configuredProxy(req)
+	}
 }
 
 func (h *Handler) fetchSourcedPlugins(ctx context.Context, proxyURL string, storeAuth []pluginstore.AuthConfig, sources []pluginstore.Source) ([]sourcedPlugin, []pluginStoreSourceErr) {
