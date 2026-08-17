@@ -69,7 +69,11 @@ func (h *Host) callHostModelStreamRead(ctx context.Context, request []byte) ([]b
 		Done:    done,
 	}
 	if chunk.Err != nil {
+		resp.StatusCode = normalizePluginHTTPStatus(chunk.Err.StatusCode)
 		resp.Error = chunk.Err.Error()
+		if resp.StatusCode > 0 {
+			resp.Error = fmt.Sprintf("model execution failed with status %d: %s", resp.StatusCode, resp.Error)
+		}
 		resp.Done = true
 	}
 	return marshalRPCResult(resp)

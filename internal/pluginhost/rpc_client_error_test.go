@@ -3,6 +3,7 @@ package pluginhost
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"testing"
 
@@ -78,5 +79,42 @@ func TestIsPluginErrorEnvelopeAcceptsNonzeroReturnEnvelope(t *testing.T) {
 	}
 	if isPluginErrorEnvelope([]byte(`not json`)) {
 		t.Fatal("isPluginErrorEnvelope accepted invalid JSON")
+	}
+}
+
+func TestMarshalRPCErrorFromErrorPreservesHTTPStatus(t *testing.T) {
+	raw := marshalRPCErrorFromError("host_call_failed", modelExecutionStatusError{
+		statusCode: http.StatusBadGateway,
+		err:        errors.New("[1308][usage limit reached]"),
+	})
+	var envelope pluginabi.Envelope
+	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
+		t.Fatalf("unmarshal envelope: %v", errUnmarshal)
+	}
+	if envelope.Error == nil {
+		t.Fatal("envelope error is nil")
+	}
+	if got := envelope.Error.HTTPStatus; got != http.StatusBadGateway {
+		t.Fatalf("http status = %d, want %d", got, http.StatusBadGateway)
+	}
+	if got := envelope.Error.Message; got != "[1308][usage limit reached]" {
+		t.Fatalf("message = %q, want original upstream message", got)
+	}
+}
+
+func TestMarshalRPCErrorFromErrorDropsInvalidHTTPStatus(t *testing.T) {
+	raw := marshalRPCErrorFromError("host_call_failed", modelExecutionStatusError{
+		statusCode: 700,
+		err:        errors.New("invalid status"),
+	})
+	var envelope pluginabi.Envelope
+	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
+		t.Fatalf("unmarshal envelope: %v", errUnmarshal)
+	}
+	if envelope.Error == nil {
+		t.Fatal("envelope error is nil")
+	}
+	if got := envelope.Error.HTTPStatus; got != 0 {
+		t.Fatalf("http status = %d, want 0 for invalid status", got)
 	}
 }

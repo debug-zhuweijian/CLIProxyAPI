@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -307,8 +308,8 @@ func decodeEnvelopeResult[T any](envelope pluginabi.Envelope) (T, error) {
 			if message == "" {
 				message = "plugin call failed"
 			}
-			if envelope.Error.HTTPStatus > 0 {
-				return zero, rpcPluginError{message: message, statusCode: envelope.Error.HTTPStatus}
+			if statusCode := normalizePluginHTTPStatus(envelope.Error.HTTPStatus); statusCode > 0 {
+				return zero, rpcPluginError{message: message, statusCode: statusCode}
 			}
 			return zero, fmt.Errorf("%s", message)
 		}
@@ -332,14 +333,42 @@ func marshalRPCEnvelope(result json.RawMessage) ([]byte, error) {
 }
 
 func marshalRPCError(code, message string) []byte {
+	return marshalRPCErrorWithStatus(code, message, 0)
+}
+
+func marshalRPCErrorFromError(code string, err error) []byte {
+	if err == nil {
+		return marshalRPCError(code, "plugin call failed")
+	}
+	type statusCoder interface {
+		StatusCode() int
+	}
+	var statusErr statusCoder
+	statusCode := 0
+	if errors.As(err, &statusErr) {
+		statusCode = statusErr.StatusCode()
+	}
+	return marshalRPCErrorWithStatus(code, err.Error(), statusCode)
+}
+
+func marshalRPCErrorWithStatus(code, message string, statusCode int) []byte {
+	statusCode = normalizePluginHTTPStatus(statusCode)
 	raw, _ := json.Marshal(pluginabi.Envelope{
 		OK: false,
 		Error: &pluginabi.Error{
-			Code:    code,
-			Message: message,
+			Code:       code,
+			Message:    message,
+			HTTPStatus: statusCode,
 		},
 	})
 	return raw
+}
+
+func normalizePluginHTTPStatus(statusCode int) int {
+	if statusCode < 100 || statusCode > 599 {
+		return 0
+	}
+	return statusCode
 }
 
 func (a *rpcPluginAdapter) openHostCallbackContext(ctx context.Context) (string, func()) {

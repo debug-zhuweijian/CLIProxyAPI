@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -293,6 +294,45 @@ func TestHostModelExecuteCallback(t *testing.T) {
 	}
 }
 
+func TestHostModelExecuteCallbackPreservesUpstreamStatus(t *testing.T) {
+	host := New()
+	upstreamErr := errors.New("[1308][usage limit reached]")
+	host.SetModelExecutor(&fakeHostModelExecutor{
+		executeModel: func(context.Context, handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage) {
+			return handlers.ModelExecutionResponse{}, &interfaces.ErrorMessage{
+				StatusCode: http.StatusBadGateway,
+				Error:      upstreamErr,
+			}
+		},
+	})
+
+	rawReq, errMarshal := json.Marshal(pluginapi.HostModelExecutionRequest{
+		EntryProtocol: "openai",
+		ExitProtocol:  "openai",
+		Model:         "glm-5.3[1m]",
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal request: %v", errMarshal)
+	}
+	_, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostModelExecute, rawReq)
+	if errCall == nil {
+		t.Fatal("callFromPlugin returned nil error")
+	}
+	if !errors.Is(errCall, upstreamErr) {
+		t.Fatalf("error = %v, want wrapped upstream error", errCall)
+	}
+	statusErr, ok := errCall.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("error %T does not expose StatusCode", errCall)
+	}
+	if got := statusErr.StatusCode(); got != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", got, http.StatusBadGateway)
+	}
+	if got := errCall.Error(); got != upstreamErr.Error() {
+		t.Fatalf("error = %q, want original upstream message", got)
+	}
+}
+
 func TestHostModelExecuteCallbackCarriesCallerPluginSkipID(t *testing.T) {
 	host := New()
 	var got handlers.ModelExecutionRequest
@@ -503,6 +543,36 @@ func TestHostModelExecuteStreamStartupErrorCleansUp(t *testing.T) {
 	}
 }
 
+func TestHostModelStreamReadPreservesTerminalStatus(t *testing.T) {
+	host := New()
+	chunks := make(chan handlers.ModelExecutionChunk, 1)
+	chunks <- handlers.ModelExecutionChunk{Err: &handlers.ModelExecutionStreamError{
+		StatusCode: http.StatusBadGateway,
+		Message:    "[1308][usage limit reached]",
+	}}
+	close(chunks)
+	streamID := host.modelStreams.open("", chunks, func() {})
+
+	rawReq, errMarshal := json.Marshal(pluginapi.HostModelStreamReadRequest{StreamID: streamID})
+	if errMarshal != nil {
+		t.Fatalf("marshal read request: %v", errMarshal)
+	}
+	rawResp, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostModelStreamRead, rawReq)
+	if errCall != nil {
+		t.Fatalf("read stream callback error = %v", errCall)
+	}
+	resp, errDecode := decodeRPCEnvelope[pluginapi.HostModelStreamReadResponse](rawResp)
+	if errDecode != nil {
+		t.Fatalf("decode read response: %v", errDecode)
+	}
+	if resp.StatusCode != http.StatusBadGateway || !resp.Done {
+		t.Fatalf("read response = %#v, want terminal status 502", resp)
+	}
+	if !strings.Contains(resp.Error, "status 502") || !strings.Contains(resp.Error, "[1308][usage limit reached]") {
+		t.Fatalf("stream error = %q, want status marker and original message", resp.Error)
+	}
+}
+
 func TestHostModelCallbacksValidateStreamMode(t *testing.T) {
 	host := New()
 
@@ -635,7 +705,7 @@ func TestHostModelStreamReadReturnsPayloadAndTerminalError(t *testing.T) {
 	if errDecode != nil {
 		t.Fatalf("decode terminal response: %v", errDecode)
 	}
-	if !terminal.Done || terminal.Error != "terminal boom" || len(terminal.Payload) != 0 {
+	if !terminal.Done || terminal.StatusCode != http.StatusBadGateway || terminal.Error != "model execution failed with status 502: terminal boom" || len(terminal.Payload) != 0 {
 		t.Fatalf("terminal read = %#v, want done terminal error", terminal)
 	}
 }

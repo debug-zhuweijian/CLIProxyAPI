@@ -649,6 +649,8 @@ type HostModelStreamReadRequest struct {
 type HostModelStreamReadResponse struct {
 	// Payload contains the raw stream chunk bytes.
 	Payload []byte `json:"payload"`
+	// StatusCode is the terminal HTTP status associated with Error, when available.
+	StatusCode int `json:"status_code,omitempty"`
 	// Error reports a stream error associated with this read.
 	Error string `json:"error"`
 	// Done reports whether the stream has ended.

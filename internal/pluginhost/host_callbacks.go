@@ -310,14 +310,34 @@ func modelExecutionError(errMsg *interfaces.ErrorMessage) error {
 	if errMsg == nil {
 		return nil
 	}
+	var executionErr error
 	if errMsg.Error != nil {
-		return errMsg.Error
+		executionErr = errMsg.Error
 	}
-	if errMsg.StatusCode > 0 {
-		return fmt.Errorf("model execution failed with status %d", errMsg.StatusCode)
+	if statusCode := normalizePluginHTTPStatus(errMsg.StatusCode); statusCode > 0 {
+		return modelExecutionStatusError{statusCode: statusCode, err: executionErr}
+	}
+	if executionErr != nil {
+		return executionErr
 	}
 	return fmt.Errorf("model execution failed")
 }
+
+type modelExecutionStatusError struct {
+	statusCode int
+	err        error
+}
+
+func (e modelExecutionStatusError) Error() string {
+	if e.err != nil {
+		return e.err.Error()
+	}
+	return fmt.Sprintf("model execution failed with status %d", e.statusCode)
+}
+
+func (e modelExecutionStatusError) Unwrap() error { return e.err }
+
+func (e modelExecutionStatusError) StatusCode() int { return e.statusCode }
 
 func (h *Host) callHostLog(ctx context.Context, request []byte) ([]byte, error) {
 	var req rpcHostLogRequest

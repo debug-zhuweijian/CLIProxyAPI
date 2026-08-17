@@ -278,16 +278,17 @@ func TestHostModelTypesPreserveFields(t *testing.T) {
 	}
 
 	readResponse := HostModelStreamReadResponse{
-		Payload: []byte("data: test\n\n"),
-		Error:   "temporary stream error",
-		Done:    true,
+		Payload:    []byte("data: test\n\n"),
+		StatusCode: http.StatusBadGateway,
+		Error:      "temporary stream error",
+		Done:       true,
 	}
 	rawReadResponse, errMarshalReadResponse := json.Marshal(readResponse)
 	if errMarshalReadResponse != nil {
 		t.Fatalf("marshal HostModelStreamReadResponse: %v", errMarshalReadResponse)
 	}
 	readResponseJSON := string(rawReadResponse)
-	for _, field := range []string{"payload", "error", "done"} {
+	for _, field := range []string{"payload", "status_code", "error", "done"} {
 		if !strings.Contains(readResponseJSON, `"`+field+`"`) {
 			t.Fatalf("HostModelStreamReadResponse JSON missing field %q: %s", field, readResponseJSON)
 		}
@@ -297,6 +298,7 @@ func TestHostModelTypesPreserveFields(t *testing.T) {
 		t.Fatalf("unmarshal HostModelStreamReadResponse: %v", errUnmarshalReadResponse)
 	}
 	if string(decodedReadResponse.Payload) != string(readResponse.Payload) ||
+		decodedReadResponse.StatusCode != readResponse.StatusCode ||
 		decodedReadResponse.Error != readResponse.Error ||
 		decodedReadResponse.Done != readResponse.Done {
 		t.Fatalf("HostModelStreamReadResponse round trip = %#v", decodedReadResponse)
