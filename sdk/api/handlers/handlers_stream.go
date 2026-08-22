@@ -8,6 +8,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelpolicy"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -40,12 +41,13 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		close(errChan)
 		return nil, nil, errChan
 	}
-	req, opts := h.pluginExecutorRequest(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, true, execOptions, admission)
-	lifecycle := h.newRequestLifecycleTracker(ctx, entryProtocol, modelName, originalRequestedModel, true, opts.Metadata, execOptions.SkipInterceptorPluginID)
+	execCtx, nestedTracker := withNestedExecutionTracker(ctx)
+	req, opts := h.pluginExecutorRequest(execCtx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, true, execOptions, admission)
+	lifecycle := h.newRequestLifecycleTracker(execCtx, entryProtocol, modelName, originalRequestedModel, true, opts.Metadata, execOptions.SkipInterceptorPluginID)
 	var interceptErr *interfaces.ErrorMessage
-	req, opts, interceptErr = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
+	req, opts, interceptErr = h.applyRequestInterceptorsBeforeAuth(execCtx, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
 	if interceptErr != nil {
-		lifecycle.completeError(ctx, interceptErr)
+		lifecycle.completeError(execCtx, interceptErr)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- interceptErr
 		close(errChan)
@@ -53,15 +55,15 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 	}
 	if errSeal := h.sealPluginExecution(entryProtocol, executorPluginID, req, &opts); errSeal != nil {
 		errMsg := executionErrorMessage(errSeal)
-		lifecycle.completeError(ctx, errMsg)
+		lifecycle.completeError(execCtx, errMsg)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
 	}
-	req, opts, interceptErr = h.applyRequestInterceptorsAfterPluginExecutorRoute(ctx, host, executorPluginID, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
+	req, opts, interceptErr = h.applyRequestInterceptorsAfterPluginExecutorRoute(execCtx, host, executorPluginID, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
 	if interceptErr != nil {
-		lifecycle.completeError(ctx, interceptErr)
+		lifecycle.completeError(execCtx, interceptErr)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- interceptErr
 		close(errChan)
@@ -69,16 +71,24 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 	}
 	if errAdmit := h.admitPluginExecution(entryProtocol, executorPluginID, req, &opts); errAdmit != nil {
 		errMsg := executionErrorMessage(errAdmit)
-		lifecycle.completeError(ctx, errMsg)
+		lifecycle.completeError(execCtx, errMsg)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
 	}
-	streamResult, errStream := host.ExecutePluginExecutorStream(ctx, executorPluginID, req, opts)
+	var reporter *helps.UsageReporter
+	if !execOptions.InternalSource {
+		reporter = helps.NewUsageReporter(execCtx, executorPluginID, modelName, nil)
+		reporter.SetTranslatedReasoningEffort(req.Payload, entryProtocol)
+	}
+	streamResult, errStream := host.ExecutePluginExecutorStream(execCtx, executorPluginID, req, opts)
 	if errStream != nil {
+		if reporter != nil && !nestedTracker.hasNestedExecution() {
+			reporter.PublishFailure(execCtx, errStream)
+		}
 		errMsg := executionErrorMessage(errStream)
-		lifecycle.completeError(ctx, errMsg)
+		lifecycle.completeError(execCtx, errMsg)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
 		close(errChan)
@@ -86,7 +96,10 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 	}
 	if streamResult == nil {
 		errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor returned nil stream")}
-		lifecycle.completeError(ctx, errMsg)
+		if reporter != nil && !nestedTracker.hasNestedExecution() {
+			reporter.PublishFailure(execCtx, errMsg.Error)
+		}
+		lifecycle.completeError(execCtx, errMsg)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
 		close(errChan)
@@ -150,8 +163,19 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		completionOutcome := pluginapi.RequestCompletionSucceeded
 		completionStatus := http.StatusOK
 		var completionErr error
+		var streamUsage helps.StreamUsageBuffer
 		defer func() {
 			lifecycle.complete(completionOutcome, completionStatus, completionErr)
+			if reporter != nil && !nestedTracker.hasNestedExecution() {
+				if completionOutcome != pluginapi.RequestCompletionSucceeded && completionErr != nil {
+					if !streamUsage.PublishFailure(execCtx, reporter, completionErr) {
+						reporter.PublishFailure(execCtx, completionErr)
+					}
+				} else {
+					streamUsage.Publish(execCtx, reporter)
+					reporter.EnsurePublished(execCtx)
+				}
+			}
 		}()
 		defer close(dataChan)
 		defer close(errChan)
@@ -205,6 +229,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 			if len(chunk.Payload) == 0 {
 				continue
 			}
+			observePluginExecutorStreamUsage(responseProtocol, chunk.Payload, &streamUsage)
 			payload := cloneBytes(chunk.Payload)
 			if streamInterceptorsActive {
 				chunkReq := pluginapi.StreamChunkInterceptRequest{
